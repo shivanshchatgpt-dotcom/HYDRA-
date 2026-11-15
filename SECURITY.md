@@ -1,11 +1,14 @@
-# SECURITY.md — HYDRA v0.2
+# SECURITY.md — HYDRA v0.3
 
 Read this before running the daemon bound to anything other than
 `127.0.0.1`. The daemon is powerful *inside its workspace*: anyone who
 can reach it and knows the token can read/write files and run shell
 commands there. In v0.2 the GUI endpoints additionally expose the
-whole screen and the keyboard/mouse — see "GUI endpoints" below. The
-whole security model is: **keep the reach small and the token secret.**
+whole screen and the keyboard/mouse; in v0.3 the browser endpoints
+expose Baji's own logged-in Chrome and the persistent/detached jobs
+keep running after the daemon stops — see "GUI endpoints", "Browser
+endpoints (CDP)" and "Persistent jobs" below. The whole security
+model is: **keep the reach small and the token secret.**
 
 ## Threat model
 
@@ -47,13 +50,37 @@ whole security model is: **keep the reach small and the token secret.**
   returned to the authenticated caller only — but nothing stops the
   caller from seeing private content on screen. Only run the daemon
   with GUI tools installed when Baji wants that level of access.
+- The browser endpoints (v0.3) drive Baji's OWN Chrome, with his
+  normal profile — including whatever he is logged into. CDP access
+  to a browser is equivalent to sitting at the keyboard inside that
+  browser: it can read page content and act as the logged-in user.
+  The daemon restricts this hard: loopback only (a non-loopback CDP
+  target is refused before any socket opens), navigation limited to
+  http/https + `about:blank` (`file:` is refused so the browser
+  cannot read local files around the jail), and audit entries carry
+  lengths/hashes only. But within those limits, treat a daemon with
+  Chrome in debug mode as full browser access. Only start Chrome
+  with `--remote-debugging-port` when browser work is actually
+  needed, and close it normally afterwards. See
+  `docs/BROWSER_SETUP.md`.
+- Persistent + detached jobs (v0.3): job records and output live in
+  `~/.local/share/hydra/jobs.db` and `job-logs/` — command output,
+  which may contain sensitive text, persists on disk until the job
+  is pruned (32-job cap) or the data dir is deleted. Detached jobs
+  are normal processes in their own session: they keep running after
+  the daemon stops, so the daemon kill switch stops Mikey's *access*
+  instantly but does not stop already-running detached work. Kill
+  detached jobs explicitly (`/jobs/kill`, or `ps`/`kill`) when that
+  matters. The opt-in systemd unit's `Restart=always` restarts a
+  *crashed* daemon in 5 seconds; an explicit
+  `systemctl --user stop hydra` still stops it for good.
 - HTTP, not HTTPS, on the Tailscale interface. Tailscale's WireGuard
   transport encrypts the traffic; the daemon itself does not do TLS.
   Never bind the daemon to a public interface (see below).
-- No per-request user approval queue in v0.2. Approval happens at a
+- No per-request user approval queue in v0.3. Approval happens at a
   coarser level: Baji starts/stops the daemon, and Mikey shows Baji
   what he is doing in chat. A future version could add an approval
-  prompt per /exec; v0.2 does not have one.
+  prompt per /exec; v0.3 does not have one.
 - The audit log is local and append-only *from the daemon*. A local
   attacker with Baji's account could edit it. It is for Baji's review,
   not forensic proof.
@@ -84,17 +111,20 @@ whole security model is: **keep the reach small and the token secret.**
    `systemctl` management verbs need explicit opt-in config.
 5. **Limits:** exec timeout (default 30s, max 300s), job timeout
    (default 1h, max 24h, max 32 concurrent jobs), output truncation
-   (200KB per stream), request body cap (5MB), search caps (500
+   (200KB per stream), job log files hard-capped at 1MB per stream
+   (RLIMIT_FSIZE), request body cap (5MB), search caps (500
    results, 30s), screenshot PNG returned base64 or saved inside the
-   workspace only, typed text capped at 4000 chars, no TTY, stdin
-   closed, child environment scrubbed of `HYDRA_*` variables.
+   workspace only, typed text capped at 4000 chars, browser evaluate
+   capped at 200KB / page content at 100KB with `truncated` flags,
+   git status capped at 200 entries, no TTY, stdin closed, child
+   environment scrubbed of `HYDRA_*` variables.
 6. **Audit:** every authenticated request is appended to
    `~/.local/share/hydra/audit.jsonl` with timestamp, endpoint,
    redacted summary (lengths/hashes, truncated command preview), and
    outcome. No tokens, no full file contents, no full memory text, no
-   search patterns, no typed text. Since v0.2 the audit entry is
-   written *before* the response is sent, so a returned result is
-   always already logged.
+   search patterns, no typed text, no URLs, no page content. Since
+   v0.2 the audit entry is written *before* the response is sent, so
+   a returned result is always already logged.
 7. **Sandbox (opt-in):** `"sandbox": true` wraps the command in
    bubblewrap: `/` read-only, workspace read-write, fresh `/tmp`,
    own PID/UTS/IPC/cgroup namespaces, no network unless
@@ -111,6 +141,27 @@ whole security model is: **keep the reach small and the token secret.**
    is never faked. Screenshots verify PNG magic bytes before
    returning. See `docs/GUI_SETUP.md` for the exact setup and the
    permissions each tool needs.
+9. **Browser endpoints (opt-in by Chrome state, loopback only):**
+   `/browser/*` only talks to a Chrome DevTools target on
+   `127.0.0.1`/`::1`/`localhost` (default port 9222). Any other host
+   is refused with 403 before a socket opens, and the CDP WebSocket
+   URL from Chrome is re-validated the same way. Navigation allows
+   http/https + `about:blank` only. Chrome must be started by Baji
+   with `--remote-debugging-port` (see `scripts/chrome-debug.sh`,
+   which never kills an existing Chrome); the daemon never starts
+   Chrome itself. Missing Chrome returns 501 naming the launch
+   script. CDP protocol failures return 502. See
+   `docs/BROWSER_SETUP.md`.
+10. **Persistent jobs + resilience:** job records (`jobs.db`) and
+    log files live under the data dir (`~/.local/share/hydra`,
+    mode 0700) and are never synced anywhere. Re-attachment after a
+    restart uses PID liveness plus `/proc/<pid>/stat` starttime, so
+    a reused PID cannot be mistaken for the original job. The PID
+    file (`hydra.pid`) is removed on clean exit; a stale PID file
+    after a crash is harmless (the next start overwrites it — never
+    trust it without checking `/health`). The systemd unit's
+    `Restart=always` only restarts after unexpected exits; Baji's
+    explicit stop always wins.
 
 ## If the token leaks
 
@@ -130,13 +181,17 @@ until you rotate. Act in this order:
 
 1. Stop the daemon and (if installed) disable the unit:
    `systemctl --user disable --now hydra`
-2. `sudo tailscale down` (or remove the `muse` device in the Tailscale
+2. Kill any detached jobs still running (they survive daemon stop):
+   `python3 hydra_client.py jobs-list` before stopping, then
+   `jobs-kill` each one — or find them with `ps` and `kill` them.
+3. `sudo tailscale down` (or remove the `muse` device in the Tailscale
    admin console).
-3. Delete the token + data: `rm -rf ~/.local/share/hydra`
-4. Delete the code if desired: `rm -rf ~/hydra-harness`
+4. Delete the token + data: `rm -rf ~/.local/share/hydra`
+   (this also deletes `jobs.db`, job logs, memory, and the audit log).
+5. Delete the code if desired: `rm -rf ~/hydra-harness`
 
-After step 1 alone, Mikey already has no access. Steps 2-4 remove the
-credentials and network path as well.
+After step 1 alone, Mikey already has no access. Steps 2-5 remove the
+running work, credentials, and network path as well.
 
 ## Reporting a problem
 

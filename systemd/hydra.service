@@ -10,9 +10,16 @@
 #   # Only if you REALLY want it on every login:
 #   systemctl --user enable hydra
 #
-# Stop:  systemctl --user stop hydra
+# Stop:  systemctl --user stop hydra     (stops for good — Restart
+#        only fires after a CRASH or unexpected exit, never after an
+#        explicit stop, and never after a clean /shutdown)
 # Logs:  journalctl --user -u hydra
 # Remove: systemctl --user disable --now hydra; rm ~/.config/systemd/user/hydra.service
+#
+# v0.3 resilience: Restart=always + RestartSec=5. If the daemon
+# crashes, systemd brings it back in 5 seconds, and v0.3's
+# persistent jobs (jobs.db + log files) are re-attached on the next
+# start. Detached jobs keep running even while the daemon is down.
 #
 # NOTE: This unit assumes the repo lives at ~/hydra-harness. If you
 # cloned it elsewhere, edit WorkingDirectory and ExecStart below.
@@ -27,9 +34,13 @@
 # endpoints return "no graphical session", start the daemon from a
 # Konsole window inside the KDE session instead (see docs/GUI_SETUP.md).
 # The file/shell/search/job endpoints work fine from this unit either way.
+# NOTE (v0.3 browser endpoints): /browser/* needs Chrome running with
+# --remote-debugging-port=9222 (see scripts/chrome-debug.sh). This
+# unit does NOT start Chrome; start it yourself when browser work is
+# needed. The daemon only ever talks to Chrome on loopback.
 
 [Unit]
-Description=HYDRA v0.2 dumb-executor daemon (no model)
+Description=HYDRA v0.3 dumb-executor daemon (no model)
 After=network-online.target
 Wants=network-online.target
 
@@ -37,7 +48,8 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=%h/hydra-harness
 ExecStart=/usr/bin/python3 -m hydra --bind 127.0.0.1 --port 8765
-Restart=no
+Restart=always
+RestartSec=5
 # Hardening: the daemon only needs the workspace + its data dir.
 NoNewPrivileges=true
 PrivateTmp=true

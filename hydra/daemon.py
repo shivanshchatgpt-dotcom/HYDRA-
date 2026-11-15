@@ -1,4 +1,4 @@
-"""HYDRA daemon v0.2: a DUMB executor for Baji's laptop.
+"""HYDRA daemon v0.3: a DUMB executor for Baji's laptop.
 
 NO model. NO Ollama. NO LLM API calls. NO internet calls.
 Mikey (in the cloud) is the brain. This daemon is only the body:
@@ -29,11 +29,26 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
 from .audit import AuditLog
+from .browser import (
+    DEFAULT_CDP_HOST,
+    DEFAULT_CDP_PORT,
+    BrowserUnavailableError,
+    CdpError,
+    browser_click,
+    browser_content,
+    browser_evaluate,
+    browser_navigate,
+    browser_shot,
+    browser_status,
+    browser_type,
+    validate_loopback,
+)
 from .gui import (
     GuiInputError,
     GuiUnavailableError,
@@ -55,8 +70,9 @@ from .security import (
     sha256_prefix,
     token_matches,
 )
+from .sysinfo import GitUnavailableError, git_status, system_info
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 DEFAULT_BIND = "127.0.0.1"
 DEFAULT_PORT = 8765
 DEFAULT_TIMEOUT_SECONDS = 30
@@ -233,8 +249,16 @@ class HydraHandler(BaseHTTPRequestHandler):
         if path == "/health":
             # Minimal + unauthenticated on purpose: proves the daemon is
             # alive without revealing paths, config, or anything else.
+            # v0.3 adds uptime + job counts (no job contents, no paths).
+            started = getattr(self, "started_at", None)
+            uptime = (round(time.monotonic() - started, 1)
+                      if started is not None else None)
+            counts = self.jobs.counts()
             self._send_json(200, {
                 "ok": True, "service": "hydra-daemon", "version": VERSION,
+                "uptime_seconds": uptime,
+                "jobs_running": counts["running"],
+                "jobs_finished": counts["finished"],
             })
             return
         self._send_json(404, {"ok": False, "error": "unknown endpoint"})
@@ -262,6 +286,15 @@ class HydraHandler(BaseHTTPRequestHandler):
             "/input/move": self._handle_input_move,
             "/input/click": self._handle_input_click,
             "/input/type": self._handle_input_type,
+            "/system/info": self._handle_system_info,
+            "/git/status": self._handle_git_status,
+            "/browser/status": self._handle_browser_status,
+            "/browser/navigate": self._handle_browser_navigate,
+            "/browser/evaluate": self._handle_browser_evaluate,
+            "/browser/content": self._handle_browser_content,
+            "/browser/shot": self._handle_browser_shot,
+            "/browser/click": self._handle_browser_click,
+            "/browser/type": self._handle_browser_type,
             "/shutdown": self._handle_shutdown,
         }
         handler = routes.get(path)
@@ -372,20 +405,24 @@ class HydraHandler(BaseHTTPRequestHandler):
         if prepared is None:
             return
         command, cwd, timeout, argv, sandboxed = prepared
+        detached = bool(payload.get("detached", False))
         try:
             job = self.jobs.start(
                 argv, command, cwd, self._scrubbed_env(),
-                timeout_seconds=timeout, sandboxed=sandboxed)
+                timeout_seconds=timeout, sandboxed=sandboxed,
+                detached=detached)
         except RuntimeError as exc:
             self._audit("/jobs/start", False, reason="too_many_jobs")
             self._send_json(429, {"ok": False, "error": str(exc)})
             return
         self._audit("/jobs/start", True, job_id=job.job_id,
                     command_preview=command[:200],
-                    command_len=len(command), sandboxed=sandboxed)
+                    command_len=len(command), sandboxed=sandboxed,
+                    detached=detached)
         self._send_json(200, {
             "ok": True, "job_id": job.job_id, "status": "running",
-            "sandboxed": sandboxed, "timeout_seconds": timeout,
+            "sandboxed": sandboxed, "detached": detached,
+            "timeout_seconds": timeout,
         })
 
     def _handle_jobs_poll(self, payload: dict) -> None:
@@ -877,6 +914,222 @@ class HydraHandler(BaseHTTPRequestHandler):
                     sha256=sha256_prefix(str(text).encode("utf-8")))
         self._send_json(200, result)
 
+    # -- read-only system + git endpoints ----------------------------------
+
+    def _handle_system_info(self, payload: dict) -> None:
+        result = system_info(self.config.workspace)
+        self._audit("/system/info", True)
+        self._send_json(200, {"ok": True, **result})
+
+    def _handle_git_status(self, payload: dict) -> None:
+        rel = str(payload.get("path", ".") or ".")
+        try:
+            result = git_status(self.config.workspace, rel)
+        except ValueError as exc:
+            self._audit("/git/status", False, reason="path_escape")
+            self._send_json(403, {"ok": False, "error": str(exc)})
+            return
+        except FileNotFoundError as exc:
+            self._send_json(404, {"ok": False, "error": str(exc)})
+            return
+        except GitUnavailableError as exc:
+            self._audit("/git/status", False, reason="git_unavailable")
+            self._send_json(501, {"ok": False, "error": str(exc)})
+            return
+        # Audit counts only: the changes list names workspace files and
+        # stays in the response, not the log.
+        self._audit("/git/status", True, path=rel[:256],
+                    is_repo=result["is_repo"],
+                    change_count=result["change_count"])
+        self._send_json(200, {"ok": True, **result})
+
+    # -- CDP browser endpoints (loopback only) -----------------------------
+
+    def _browser_target(self, payload: dict, endpoint: str):
+        """Parse + validate the CDP target from the request.
+
+        Returns (host, port, target_id), or sends the error response
+        and returns None. Non-loopback hosts are refused here, before
+        any socket is opened.
+        """
+        host = str(payload.get("host", DEFAULT_CDP_HOST) or DEFAULT_CDP_HOST)
+        try:
+            port = int(payload.get("port", DEFAULT_CDP_PORT))
+        except (TypeError, ValueError):
+            self._send_json(400, {"ok": False,
+                                  "error": "port must be an integer"})
+            return None
+        if not 1 <= port <= 65535:
+            self._send_json(400, {"ok": False, "error": "port out of range"})
+            return None
+        target_id = payload.get("target_id")
+        if target_id is not None and not isinstance(target_id, str):
+            self._send_json(400, {"ok": False,
+                                  "error": "target_id must be a string"})
+            return None
+        try:
+            validate_loopback(host)
+        except ValueError as exc:
+            self._audit(endpoint, False, reason="non_loopback_cdp",
+                        host=host[:64])
+            self._send_json(403, {"ok": False, "error": str(exc)})
+            return None
+        return host, port, target_id
+
+    def _browser_error(self, endpoint: str, exc: Exception) -> None:
+        """Map a browser-layer failure to an HTTP response.
+
+        501 = Chrome is not running with remote debugging (tells the
+        caller exactly what to start). 502 = Chrome answered but the
+        CDP command failed. 400 = bad request (bad URL/expression).
+        """
+        if isinstance(exc, BrowserUnavailableError):
+            self._audit(endpoint, False, reason="browser_unavailable")
+            self._send_json(501, {"ok": False, "error": str(exc)})
+        elif isinstance(exc, CdpError):
+            self._audit(endpoint, False, reason="cdp_error")
+            self._send_json(502, {"ok": False, "error": str(exc)})
+        else:
+            self._send_json(400, {"ok": False, "error": str(exc)})
+
+    def _handle_browser_status(self, payload: dict) -> None:
+        target = self._browser_target(payload, "/browser/status")
+        if target is None:
+            return
+        host, port, _target_id = target
+        # A probe by design: an absent browser is a 200 with
+        # available=false, not an error — the caller asked "is it up?".
+        result = browser_status(host, port)
+        self._audit("/browser/status", True,
+                    available=result["available"])
+        self._send_json(200, {"ok": True, **result})
+
+    def _handle_browser_navigate(self, payload: dict) -> None:
+        target = self._browser_target(payload, "/browser/navigate")
+        if target is None:
+            return
+        host, port, target_id = target
+        url = payload.get("url", "")
+        if not isinstance(url, str):
+            self._send_json(400, {"ok": False, "error": "url must be a string"})
+            return
+        try:
+            result = browser_navigate(host, port, url, target_id)
+        except (ValueError, CdpError) as exc:
+            self._browser_error("/browser/navigate", exc)
+            return
+        # Audit length + hash only, never the URL.
+        self._audit("/browser/navigate", True, url_len=len(url),
+                    sha256=sha256_prefix(url.encode("utf-8")),
+                    target_id=result.get("target_id"))
+        self._send_json(200, {"ok": True, **result})
+
+    def _handle_browser_evaluate(self, payload: dict) -> None:
+        target = self._browser_target(payload, "/browser/evaluate")
+        if target is None:
+            return
+        host, port, target_id = target
+        expression = payload.get("expression", "")
+        if not isinstance(expression, str):
+            self._send_json(400, {"ok": False,
+                                  "error": "expression must be a string"})
+            return
+        try:
+            result = browser_evaluate(host, port, expression, target_id)
+        except (ValueError, CdpError) as exc:
+            self._browser_error("/browser/evaluate", exc)
+            return
+        self._audit("/browser/evaluate", True,
+                    expression_len=len(expression),
+                    sha256=sha256_prefix(expression.encode("utf-8")),
+                    truncated=result.get("truncated", False))
+        self._send_json(200, {"ok": True, **result})
+
+    def _handle_browser_content(self, payload: dict) -> None:
+        target = self._browser_target(payload, "/browser/content")
+        if target is None:
+            return
+        host, port, target_id = target
+        try:
+            result = browser_content(host, port, target_id)
+        except CdpError as exc:
+            self._browser_error("/browser/content", exc)
+            return
+        # Never log page content: lengths only.
+        self._audit("/browser/content", True,
+                    text_len=len(result["text"]),
+                    html_len=len(result["html"]),
+                    text_truncated=result["text_truncated"],
+                    html_truncated=result["html_truncated"])
+        self._send_json(200, {"ok": True, **result})
+
+    def _handle_browser_shot(self, payload: dict) -> None:
+        target = self._browser_target(payload, "/browser/shot")
+        if target is None:
+            return
+        host, port, target_id = target
+        try:
+            result = browser_shot(host, port, target_id)
+        except CdpError as exc:
+            self._browser_error("/browser/shot", exc)
+            return
+        png = result["png"]
+        save_to = payload.get("save_to")
+        if save_to is not None:
+            try:
+                path = resolve_inside(self.config.workspace, str(save_to))
+            except ValueError as exc:
+                self._audit("/browser/shot", False, reason="path_escape")
+                self._send_json(403, {"ok": False, "error": str(exc)})
+                return
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(png)
+            self._audit("/browser/shot", True, backend="cdp",
+                        bytes=len(png), path=str(save_to)[:256])
+            self._send_json(200, {
+                "ok": True, "path": str(save_to), "backend": "cdp",
+                "width": result["width"], "height": result["height"],
+                "bytes": len(png),
+            })
+            return
+        self._audit("/browser/shot", True, backend="cdp", bytes=len(png))
+        self._send_json(200, {
+            "ok": True, "format": "png",
+            "data_base64": base64.b64encode(png).decode("ascii"),
+            "backend": "cdp", "width": result["width"],
+            "height": result["height"], "bytes": len(png),
+        })
+
+    def _handle_browser_click(self, payload: dict) -> None:
+        target = self._browser_target(payload, "/browser/click")
+        if target is None:
+            return
+        host, port, target_id = target
+        try:
+            result = browser_click(host, port, payload.get("x"),
+                                   payload.get("y"), target_id)
+        except (ValueError, CdpError) as exc:
+            self._browser_error("/browser/click", exc)
+            return
+        self._audit("/browser/click", True, x=result["x"], y=result["y"])
+        self._send_json(200, {"ok": True, **result})
+
+    def _handle_browser_type(self, payload: dict) -> None:
+        target = self._browser_target(payload, "/browser/type")
+        if target is None:
+            return
+        host, port, target_id = target
+        text = payload.get("text", "")
+        try:
+            result = browser_type(host, port, text, target_id)
+        except (ValueError, CdpError) as exc:
+            self._browser_error("/browser/type", exc)
+            return
+        # Never log typed text: length + hash only.
+        self._audit("/browser/type", True, text_len=len(text),
+                    sha256=sha256_prefix(str(text).encode("utf-8")))
+        self._send_json(200, {"ok": True, **result})
+
     # -- shutdown ----------------------------------------------------------
 
     def _handle_shutdown(self, payload: dict) -> None:
@@ -975,10 +1228,12 @@ def make_server(config: Config, token: str) -> ThreadingHTTPServer:
     handler.token = token
     handler.audit = AuditLog(config.audit_path)
     handler.store = MemoryStore(config.db_path)
-    jobs = JobManager()
+    jobs = JobManager(data_dir=getattr(config, "data_dir", None))
     handler.jobs = jobs
+    handler.started_at = time.monotonic()
     # If the daemon process exits (Ctrl-C, shutdown), kill any running
-    # background jobs instead of orphaning them.
+    # NON-detached background jobs instead of orphaning them. Detached
+    # jobs survive on purpose and are re-attached on the next start.
     atexit.register(jobs.kill_all)
     return ThreadingHTTPServer((config.bind, config.port), handler)
 
@@ -986,7 +1241,7 @@ def make_server(config: Config, token: str) -> ThreadingHTTPServer:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="hydra",
-        description="HYDRA v0.2 dumb-executor daemon (no model, no network calls).",
+        description="HYDRA v0.3 dumb-executor daemon (no model, no network calls).",
     )
     parser.add_argument("--bind", default=None,
                         help=f"bind address (default {DEFAULT_BIND})")
@@ -1024,15 +1279,24 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     server = make_server(config, token)
+    pid_path = config.data_dir / "hydra.pid"
+    try:
+        pid_path.write_text(f"{os.getpid()}\n", encoding="ascii")
+    except OSError as exc:
+        print(f"[hydra] warning: could not write PID file: {exc}",
+              file=sys.stderr)
+        pid_path = None
     print("=" * 64)
-    print("HYDRA daemon v0.2  —  DUMB EXECUTOR ONLY")
+    print("HYDRA daemon v0.3  —  DUMB EXECUTOR ONLY")
     print("No model. No Ollama. No LLM calls. Mikey (cloud) is the brain.")
     print("=" * 64)
     print(f"Listening on  http://{config.bind}:{config.port}")
     print(f"Workspace     {config.workspace}")
     print(f"Data dir      {config.data_dir}")
     print(f"Memory DB     {config.db_path}")
+    print(f"Jobs DB       {config.data_dir / 'jobs.db'}")
     print(f"Audit log     {config.audit_path}")
+    print(f"PID file      {pid_path}")
     print(f"Token file    {config.token_file}  (never share this file)")
     if config.bind == "0.0.0.0":
         print("!!! WARNING: bound to 0.0.0.0 (--allow-public). Anyone who")
@@ -1040,12 +1304,20 @@ def main(argv: list[str] | None = None) -> int:
         print("!!! inside the workspace. Prefer 127.0.0.1 / Tailscale IP.")
     print("Stop with: Ctrl-C, or POST /shutdown, or:")
     print("  systemctl --user stop hydra   (only if you installed the unit)")
+    print("Detached jobs keep running after shutdown; see /jobs/list.")
     print("=" * 64, flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n[hydra] stopping (Ctrl-C)", file=sys.stderr)
     finally:
+        if pid_path is not None:
+            try:
+                if pid_path.read_text(
+                        encoding="ascii").strip() == str(os.getpid()):
+                    pid_path.unlink()
+            except OSError:
+                pass
         server.server_close()
     return 0
 

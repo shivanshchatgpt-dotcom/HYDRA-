@@ -1,26 +1,32 @@
 #!/usr/bin/env bash
-# HYDRA v0.2 Arch Linux setup (Baji's laptop: Arch + KDE Plasma + Wayland).
+# HYDRA v0.3 Arch Linux setup (Baji's laptop: Arch + KDE Plasma + Wayland).
 #
 # What this script DOES:
 #   * checks python3 (>= 3.11) and tailscale presence (read-only checks)
-#   * checks the OPTIONAL v0.2 tools (ripgrep, bubblewrap, ydotool,
-#     spectacle/grim) and prints install guidance for the missing ones
+#   * checks the OPTIONAL tools (ripgrep, bubblewrap, ydotool,
+#     spectacle/grim, Chrome/Chromium for CDP browser control) and
+#     prints install guidance for the missing ones
 #   * creates ~/hydra-workspace and ~/.local/share/hydra
 #   * generates a 0600 bearer token file if one does not exist
-#   * prints exact next steps (Tailscale login, start, test)
+#   * prints exact next steps (Tailscale login, start, test), including
+#     the OPT-IN autostart commands (printed only, never run)
 #
 # What this script NEVER does:
 #   * never runs sudo / pacman -S (install guidance is printed only;
 #     Baji runs it himself after reading it)
 #   * never changes firewall rules
-#   * never enables auto-start (systemd unit install is a separate,
-#     manual, opt-in step; see README.md)
+#   * never enables auto-start (the systemd unit has Restart=always,
+#     but installing/enabling it is a separate, manual, opt-in step;
+#     this script only PRINTS the commands — see README.md)
 #   * never touches the network, never phones home
 #
-# v0.2 scope: files + shell + patch edits + search + background jobs
-# inside the workspace, optional bubblewrap sandbox, and best-effort
-# GUI endpoints (screenshot + input) when the tools below are present.
-# NO browser control (future work, see docs/ARCHITECTURE.md).
+# v0.3 scope: files + shell + patch edits + search + PERSISTENT and
+# DETACHED background jobs inside the workspace, optional bubblewrap
+# sandbox, best-effort GUI endpoints (screenshot + input), read-only
+# system/git endpoints, and loopback-only CDP browser control when
+# Chrome is running with --remote-debugging-port (see docs/BROWSER_SETUP.md).
+# NO agent loop, NO scheduling inside the daemon, NO model — Mikey in
+# the cloud is the brain; this daemon is only the body.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -28,7 +34,7 @@ WORKSPACE="${HYDRA_WORKSPACE:-$HOME/hydra-workspace}"
 DATA_DIR="${HYDRA_DATA_DIR:-$HOME/.local/share/hydra}"
 TOKEN_FILE="${HYDRA_TOKEN_FILE:-$DATA_DIR/token}"
 
-echo "=== HYDRA v0.2 setup (Arch Linux) ==="
+echo "=== HYDRA v0.3 setup (Arch Linux) ==="
 echo "Repo:      $REPO_DIR"
 echo "Workspace: $WORKSPACE"
 echo "Data dir:  $DATA_DIR"
@@ -59,10 +65,10 @@ else
 fi
 echo
 
-# 3. Optional v0.2 tools (read-only checks; install guidance only).
+# 3. Optional v0.3 tools (read-only checks; install guidance only).
 # The daemon works without all of these; each missing tool only
 # disables the endpoints that need it, with a clear 501 error.
-echo "Optional v0.2 tools:"
+echo "Optional v0.3 tools:"
 if command -v rg >/dev/null 2>&1; then
   echo "  ripgrep (rg): found — /search uses it (fast path)"
 else
@@ -94,7 +100,15 @@ else
   echo "    path instead (needs a permission dialog the first time)."
   echo "    To install spectacle yourself: sudo pacman -S spectacle"
 fi
-echo "See docs/GUI_SETUP.md for the full GUI/sandbox setup checklist."
+if command -v google-chrome >/dev/null 2>&1 || command -v chromium >/dev/null 2>&1; then
+  echo "  Chrome/Chromium: found — /browser/* endpoints available once Chrome"
+  echo "    is running with remote debugging (see scripts/chrome-debug.sh)."
+else
+  echo "  Chrome/Chromium: NOT FOUND — /browser/* endpoints return 501."
+  echo "    Install Chrome yourself (AUR: google-chrome) if you want them."
+fi
+echo "See docs/GUI_SETUP.md for the GUI/sandbox checklist and"
+echo "docs/BROWSER_SETUP.md for the Chrome debugging checklist."
 echo
 
 # 4. Directories.
@@ -142,4 +156,21 @@ echo "   (The last two need the optional tools above; without them"
 echo "    you get a clear error naming the missing tool.)"
 echo
 echo "5) Stop anytime with Ctrl-C in the daemon terminal."
-echo "   No auto-start is installed. See README.md for uninstall."
+echo "   No auto-start is installed by this script. See README.md."
+echo
+echo "6) OPTIONAL autostart (opt-in only — these commands are PRINTED,"
+echo "   NOT run by this script; run them yourself only if you want the"
+echo "   daemon to come back on its own after a crash or a reboot):"
+echo "     mkdir -p ~/.config/systemd/user"
+echo "     cp systemd/hydra.service ~/.config/systemd/user/hydra.service"
+echo "     systemctl --user daemon-reload"
+echo "     systemctl --user enable --now hydra"
+echo "   The unit has Restart=always, so a crashed daemon restarts in"
+echo "   5 seconds. An explicit 'systemctl --user stop hydra' still"
+echo "   stops it for good. Detached jobs survive daemon restarts;"
+echo "   see docs/AUTONOMY.md for what runs without you present."
+echo
+echo "7) OPTIONAL browser control: start Chrome with remote debugging:"
+echo "     ./scripts/chrome-debug.sh"
+echo "   (Uses your normal profile; never kills a running Chrome.)"
+echo "   Then: python3 hydra_client.py browser-status"

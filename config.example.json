@@ -1,5 +1,5 @@
 {
-    "_comment": "HYDRA v0.2 example config. Copy to ~/.config/hydra/config.json and edit. CLI flags and HYDRA_* env vars override these values. NEVER put the bearer token in this file. v0.2 adds no new config keys: sandbox and GUI endpoints are requested per-call and need only the optional tools (see docs/GUI_SETUP.md).",
+    "_comment": "HYDRA v0.3 example config. Copy to ~/.config/hydra/config.json and edit. CLI flags and HYDRA_* env vars override these values. NEVER put the bearer token in this file. v0.3 adds no new config keys: persistent/detached jobs, system/git endpoints and CDP browser control are requested per-call (browser control is loopback-only by code, not by config; see docs/BROWSER_SETUP.md).",
     "allow_systemctl_manage": false,
     "bind": "127.0.0.1",
     "blocklist_extra": [],

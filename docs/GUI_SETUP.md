@@ -170,7 +170,8 @@ fail too (no network), unless `--sandbox-allow-network` is used.
 
 ## 7. What is NOT set up here
 
-Browser control (CDP) is not part of v0.2 and needs no setup now.
-When it is added, it will need Chrome/Chromium started by Baji with
-`--remote-debugging-port` (localhost-only) plus a websocket client.
-See `docs/ARCHITECTURE.md`, "What v0.2 deliberately leaves out".
+Browser control (CDP) arrived in v0.3 and is documented separately:
+see `docs/BROWSER_SETUP.md` for the Chrome launch, the
+`scripts/chrome-debug.sh` helper, and the live CDP checklist. It
+needs no GUI tooling from this document — only Chrome running with
+`--remote-debugging-port` on loopback.

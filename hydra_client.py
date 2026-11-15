@@ -14,9 +14,19 @@ Examples:
     python3 hydra_client.py search --pattern "TODO" --glob "*.py"
     python3 hydra_client.py list --path .
     python3 hydra_client.py jobs-start --command "sleep 60"
+    python3 hydra_client.py jobs-start --command "make" --detached
     python3 hydra_client.py jobs-poll --job-id <id>
     python3 hydra_client.py jobs-kill --job-id <id>
     python3 hydra_client.py jobs-list
+    python3 hydra_client.py system-info
+    python3 hydra_client.py git-status --path .
+    python3 hydra_client.py browser-status
+    python3 hydra_client.py browser-navigate --url https://example.com
+    python3 hydra_client.py browser-evaluate --expression "document.title"
+    python3 hydra_client.py browser-content
+    python3 hydra_client.py browser-shot --save-to shots/page.png
+    python3 hydra_client.py browser-click --x 100 --y 200
+    python3 hydra_client.py browser-type --text "hello"
     python3 hydra_client.py memory-add --text "Baji uses Arch Linux" --kind fact
     python3 hydra_client.py memory-search --query "Arch Linux"
     python3 hydra_client.py memory-list
@@ -106,6 +116,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--cwd", default=".")
     p.add_argument("--timeout", type=int, default=3600)
     p.add_argument("--sandbox", action="store_true")
+    p.add_argument("--detached", action="store_true",
+                   help="survive daemon shutdown/restart (re-attached later)")
     p = sub.add_parser("jobs-poll")
     p.add_argument("--job-id", required=True)
     p.add_argument("--offset", type=int, default=0)
@@ -143,6 +155,27 @@ def main(argv: list[str] | None = None) -> int:
                    choices=["left", "middle", "right"])
     p.add_argument("--clicks", type=int, default=1)
     p = sub.add_parser("input-type")
+    p.add_argument("--text", required=True)
+    sub.add_parser("system-info")
+    p = sub.add_parser("git-status")
+    p.add_argument("--path", default=".")
+    browser = argparse.ArgumentParser(add_help=False)
+    browser.add_argument("--port", type=int, default=9222,
+                         help="Chrome remote-debugging port (loopback only)")
+    browser.add_argument("--target-id", default=None,
+                         help="CDP page target id (default: first page)")
+    sub.add_parser("browser-status", parents=[browser])
+    p = sub.add_parser("browser-navigate", parents=[browser])
+    p.add_argument("--url", required=True)
+    p = sub.add_parser("browser-evaluate", parents=[browser])
+    p.add_argument("--expression", required=True)
+    sub.add_parser("browser-content", parents=[browser])
+    p = sub.add_parser("browser-shot", parents=[browser])
+    p.add_argument("--save-to", default=None)
+    p = sub.add_parser("browser-click", parents=[browser])
+    p.add_argument("--x", type=int, required=True)
+    p.add_argument("--y", type=int, required=True)
+    p = sub.add_parser("browser-type", parents=[browser])
     p.add_argument("--text", required=True)
     sub.add_parser("shutdown")
 
@@ -185,7 +218,8 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "jobs-start":
         result = call(args.url, token, "/jobs/start", {
             "command": args.command, "cwd": args.cwd,
-            "timeout_seconds": args.timeout, "sandbox": args.sandbox})
+            "timeout_seconds": args.timeout, "sandbox": args.sandbox,
+            "detached": args.detached})
     elif args.cmd == "jobs-poll":
         result = call(args.url, token, "/jobs/poll", {
             "job_id": args.job_id, "offset": args.offset})
@@ -234,6 +268,49 @@ def main(argv: list[str] | None = None) -> int:
             "clicks": args.clicks})
     elif args.cmd == "input-type":
         result = call(args.url, token, "/input/type", {"text": args.text})
+    elif args.cmd == "system-info":
+        result = call(args.url, token, "/system/info", {})
+    elif args.cmd == "git-status":
+        result = call(args.url, token, "/git/status", {"path": args.path})
+    elif args.cmd == "browser-status":
+        result = call(args.url, token, "/browser/status",
+                      {"port": args.port})
+    elif args.cmd == "browser-navigate":
+        payload = {"url": args.url, "port": args.port}
+        if args.target_id:
+            payload["target_id"] = args.target_id
+        result = call(args.url, token, "/browser/navigate", payload)
+    elif args.cmd == "browser-evaluate":
+        payload = {"expression": args.expression, "port": args.port}
+        if args.target_id:
+            payload["target_id"] = args.target_id
+        result = call(args.url, token, "/browser/evaluate", payload)
+    elif args.cmd == "browser-content":
+        payload = {"port": args.port}
+        if args.target_id:
+            payload["target_id"] = args.target_id
+        result = call(args.url, token, "/browser/content", payload)
+    elif args.cmd == "browser-shot":
+        payload = {"port": args.port}
+        if args.target_id:
+            payload["target_id"] = args.target_id
+        if args.save_to:
+            payload["save_to"] = args.save_to
+        result = call(args.url, token, "/browser/shot", payload)
+        if "data_base64" in result:
+            # Don't dump megabytes of base64 to the terminal.
+            result = {k: ("<base64 png, %d bytes>" % len(v) if k == "data_base64" else v)
+                      for k, v in result.items()}
+    elif args.cmd == "browser-click":
+        payload = {"x": args.x, "y": args.y, "port": args.port}
+        if args.target_id:
+            payload["target_id"] = args.target_id
+        result = call(args.url, token, "/browser/click", payload)
+    elif args.cmd == "browser-type":
+        payload = {"text": args.text, "port": args.port}
+        if args.target_id:
+            payload["target_id"] = args.target_id
+        result = call(args.url, token, "/browser/type", payload)
     elif args.cmd == "shutdown":
         result = call(args.url, token, "/shutdown", {"confirm": True})
     else:  # pragma: no cover

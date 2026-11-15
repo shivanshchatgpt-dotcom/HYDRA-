@@ -129,10 +129,11 @@ class HttpDaemonV02Tests(unittest.TestCase):
     # -- version -------------------------------------------------------
 
     def test_health_reports_v02(self):
+        # Kept name (v0.2 test file); v0.3 bumps the version assertion.
         status, body = self.request("GET", "/health", token="none")
         self.assertEqual(status, 200)
-        self.assertEqual(body["version"], "0.2.0")
-        self.assertEqual(VERSION, "0.2.0")
+        self.assertEqual(body["version"], "0.3.0")
+        self.assertEqual(VERSION, "0.3.0")
 
     # -- /edit ---------------------------------------------------------
 
