@@ -218,6 +218,35 @@ class MemoryStore:
             self._conn.commit()
             return rel_id
 
+    # -- deletes ---------------------------------------------------------
+
+    def delete_memory(self, memory_id: int) -> bool:
+        """Delete one memory by id (FTS index follows via trigger).
+
+        Relations sourced from that memory are removed too; entities
+        stay (other memories may mention them). Returns True when a
+        row was actually deleted.
+        """
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("DELETE FROM memories WHERE id = ?", (int(memory_id),))
+            deleted = cur.rowcount > 0
+            if deleted:
+                cur.execute(
+                    "DELETE FROM relations WHERE source_memory_id = ?",
+                    (int(memory_id),))
+            self._conn.commit()
+            return deleted
+
+    def delete_relation(self, relation_id: int) -> bool:
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("DELETE FROM relations WHERE id = ?",
+                        (int(relation_id),))
+            deleted = cur.rowcount > 0
+            self._conn.commit()
+            return deleted
+
     # -- reads -----------------------------------------------------------
 
     def search(self, query: str, limit: int = 10) -> dict:
@@ -289,3 +318,34 @@ class MemoryStore:
         with self._lock:
             cur = self._conn.cursor()
             return self._neighbors_locked(cur, entity.strip(), limit=limit)
+
+    def list_recent(self, limit: int = 20, kind: str | None = None) -> dict:
+        """Newest memories first, optionally filtered by kind."""
+        limit = max(1, min(int(limit or 20), 100))
+        with self._lock:
+            cur = self._conn.cursor()
+            if kind:
+                rows = cur.execute(
+                    "SELECT id, text, kind, source, created_at"
+                    " FROM memories WHERE kind = ?"
+                    " ORDER BY id DESC LIMIT ?",
+                    (kind, limit),
+                ).fetchall()
+                total = cur.execute(
+                    "SELECT COUNT(*) FROM memories WHERE kind = ?",
+                    (kind,),
+                ).fetchone()[0]
+            else:
+                rows = cur.execute(
+                    "SELECT id, text, kind, source, created_at"
+                    " FROM memories ORDER BY id DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+                total = cur.execute(
+                    "SELECT COUNT(*) FROM memories").fetchone()[0]
+            return {
+                "memories": [dict(r) for r in rows],
+                "count": len(rows),
+                "total": int(total),
+                "kind": kind,
+            }

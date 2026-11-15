@@ -1,10 +1,11 @@
-# SECURITY.md — HYDRA v0.1
+# SECURITY.md — HYDRA v0.2
 
 Read this before running the daemon bound to anything other than
 `127.0.0.1`. The daemon is powerful *inside its workspace*: anyone who
 can reach it and knows the token can read/write files and run shell
-commands there. The whole security model is: **keep the reach small
-and the token secret.**
+commands there. In v0.2 the GUI endpoints additionally expose the
+whole screen and the keyboard/mouse — see "GUI endpoints" below. The
+whole security model is: **keep the reach small and the token secret.**
 
 ## Threat model
 
@@ -23,20 +24,36 @@ and the token secret.**
   write). The blocklist refuses the most dangerous patterns, but it is
   a safety net, not a sandbox. Do not ask Mikey to run untrusted code.
 
-**Out of scope for v0.1 (known gaps, stated honestly):**
-- No sandbox / container / VM isolation. Commands run as Baji's user,
-  with Baji's normal permissions, inside the workspace jail only.
-  A command that stays inside the workspace but is still harmful
-  (e.g. deleting all workspace files with plain `rm file`) is NOT
-  blocked. The jail limits *where*, not *whether* work is destructive
-  inside the workspace. Keep backups of anything important.
+**Out of scope / known gaps (stated honestly):**
+- No sandbox / container / VM isolation **by default**. Commands run
+  as Baji's user, with Baji's normal permissions, inside the workspace
+  jail only. v0.2 adds an *opt-in* bubblewrap sandbox (`"sandbox":
+  true` on `/exec` and `/jobs/start`): system read-only, workspace
+  read-write, no network by default. The sandbox is only as strong as
+  bubblewrap + unprivileged user namespaces on the host kernel, and it
+  does not limit CPU/RAM. A command that stays inside the workspace but
+  is still harmful (e.g. deleting all workspace files with plain
+  `rm file`) is NOT blocked, sandboxed or not. The jail limits *where*,
+  not *whether* work is destructive inside the workspace. Keep backups
+  of anything important.
+- The GUI endpoints (v0.2) are the widest access the daemon has: a
+  screenshot sees the whole screen (all apps, all windows), and input
+  control can click/type anywhere, including outside the workspace
+  concept entirely. They exist because Baji asked for full open control
+  of the laptop, and they are gated only by the bearer token + the
+  daemon running. Treat a running daemon with GUI tools installed as
+  equivalent to sitting at the keyboard. The audit log records that a
+  screenshot/input happened (never typed text), and screenshots are
+  returned to the authenticated caller only — but nothing stops the
+  caller from seeing private content on screen. Only run the daemon
+  with GUI tools installed when Baji wants that level of access.
 - HTTP, not HTTPS, on the Tailscale interface. Tailscale's WireGuard
   transport encrypts the traffic; the daemon itself does not do TLS.
   Never bind the daemon to a public interface (see below).
-- No per-request user approval queue in v0.1. Approval happens at a
+- No per-request user approval queue in v0.2. Approval happens at a
   coarser level: Baji starts/stops the daemon, and Mikey shows Baji
   what he is doing in chat. A future version could add an approval
-  prompt per /exec; v0.1 does not have one.
+  prompt per /exec; v0.2 does not have one.
 - The audit log is local and append-only *from the daemon*. A local
   attacker with Baji's account could edit it. It is for Baji's review,
   not forensic proof.
@@ -65,13 +82,35 @@ and the token secret.**
    outside the workspace are refused. The full list is in
    `hydra/security.py` — read it, it is meant to be audited.
    `systemctl` management verbs need explicit opt-in config.
-5. **Limits:** exec timeout (default 30s, max 300s), output truncation
-   (200KB per stream), request body cap (5MB), no TTY, stdin closed,
-   child environment scrubbed of `HYDRA_*` variables.
+5. **Limits:** exec timeout (default 30s, max 300s), job timeout
+   (default 1h, max 24h, max 32 concurrent jobs), output truncation
+   (200KB per stream), request body cap (5MB), search caps (500
+   results, 30s), screenshot PNG returned base64 or saved inside the
+   workspace only, typed text capped at 4000 chars, no TTY, stdin
+   closed, child environment scrubbed of `HYDRA_*` variables.
 6. **Audit:** every authenticated request is appended to
    `~/.local/share/hydra/audit.jsonl` with timestamp, endpoint,
    redacted summary (lengths/hashes, truncated command preview), and
-   outcome. No tokens, no full file contents, no full memory text.
+   outcome. No tokens, no full file contents, no full memory text, no
+   search patterns, no typed text. Since v0.2 the audit entry is
+   written *before* the response is sent, so a returned result is
+   always already logged.
+7. **Sandbox (opt-in):** `"sandbox": true` wraps the command in
+   bubblewrap: `/` read-only, workspace read-write, fresh `/tmp`,
+   own PID/UTS/IPC/cgroup namespaces, no network unless
+   `"sandbox_no_network": false`. If `bwrap` is missing the request
+   fails with 501 naming bubblewrap — it is never silently run
+   unsandboxed. Sandboxed commands still run as Baji's user and can
+   still destroy workspace files; the sandbox limits reach outside
+   the workspace, not destructiveness inside it.
+8. **GUI endpoints (opt-in by tooling):** `/screen/shot` and
+   `/input/*` only work when the helper tools are installed
+   (spectacle/grim/portal for screenshots, ydotool + ydotoold for
+   input) and the daemon runs inside the graphical session. Missing
+   tools or a missing session produce a 501 naming the gap — success
+   is never faked. Screenshots verify PNG magic bytes before
+   returning. See `docs/GUI_SETUP.md` for the exact setup and the
+   permissions each tool needs.
 
 ## If the token leaks
 

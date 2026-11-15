@@ -1,4 +1,4 @@
-"""HYDRA daemon v0.1: a DUMB executor for Baji's laptop.
+"""HYDRA daemon v0.2: a DUMB executor for Baji's laptop.
 
 NO model. NO Ollama. NO LLM API calls. NO internet calls.
 Mikey (in the cloud) is the brain. This daemon is only the body:
@@ -20,6 +20,8 @@ Run:
 from __future__ import annotations
 
 import argparse
+import atexit
+import base64
 import ipaddress
 import json
 import os
@@ -32,7 +34,18 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from .audit import AuditLog
+from .gui import (
+    GuiInputError,
+    GuiUnavailableError,
+    input_click,
+    input_move,
+    input_type,
+    take_screenshot,
+)
+from .jobs import JobManager
 from .memory_store import MemoryStore
+from .sandbox import SandboxUnavailableError, build_bwrap_argv
+from .search import SearchError, run_search
 from .security import (
     check_command_blocked,
     load_token,
@@ -43,11 +56,13 @@ from .security import (
     token_matches,
 )
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 DEFAULT_BIND = "127.0.0.1"
 DEFAULT_PORT = 8765
 DEFAULT_TIMEOUT_SECONDS = 30
 MAX_TIMEOUT_SECONDS = 300
+MAX_JOB_TIMEOUT_SECONDS = 86400  # jobs may run long; default is 1 hour
+DEFAULT_JOB_TIMEOUT_SECONDS = 3600
 MAX_OUTPUT_BYTES = 200 * 1024  # per stream (stdout / stderr)
 MAX_REQUEST_BYTES = 5 * 1024 * 1024
 MAX_LIST_ENTRIES = 500
@@ -142,6 +157,7 @@ class HydraHandler(BaseHTTPRequestHandler):
     token: str
     audit: AuditLog
     store: MemoryStore
+    jobs: JobManager
     server: ThreadingHTTPServer  # type: ignore[assignment]
 
     protocol_version = "HTTP/1.1"
@@ -229,11 +245,23 @@ class HydraHandler(BaseHTTPRequestHandler):
             "/exec": self._handle_exec,
             "/read": self._handle_read,
             "/write": self._handle_write,
+            "/edit": self._handle_edit,
+            "/search": self._handle_search,
             "/list": self._handle_list,
+            "/jobs/start": self._handle_jobs_start,
+            "/jobs/poll": self._handle_jobs_poll,
+            "/jobs/kill": self._handle_jobs_kill,
+            "/jobs/list": self._handle_jobs_list,
             "/memory/add": self._handle_memory_add,
             "/memory/search": self._handle_memory_search,
+            "/memory/delete": self._handle_memory_delete,
+            "/memory/list": self._handle_memory_list,
             "/memory/graph/add": self._handle_graph_add,
             "/memory/graph/neighbors": self._handle_graph_neighbors,
+            "/screen/shot": self._handle_screen_shot,
+            "/input/move": self._handle_input_move,
+            "/input/click": self._handle_input_click,
+            "/input/type": self._handle_input_type,
             "/shutdown": self._handle_shutdown,
         }
         handler = routes.get(path)
@@ -247,30 +275,46 @@ class HydraHandler(BaseHTTPRequestHandler):
         try:
             payload = self._read_json()
         except ValueError as exc:
-            self._send_json(400, {"ok": False, "error": str(exc)})
             self._audit(path, False, reason="bad_request")
+            self._send_json(400, {"ok": False, "error": str(exc)})
             return
         handler(payload)
 
     # -- file + shell endpoints ------------------------------------------
 
-    def _handle_exec(self, payload: dict) -> None:
+    def _scrubbed_env(self) -> dict[str, str]:
+        # HYDRA secrets never reach the child.
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("HYDRA_")}
+        env.setdefault("TERM", "dumb")
+        return env
+
+    def _prepare_command(
+        self, payload: dict, endpoint: str, max_timeout: int,
+        default_timeout: int,
+    ) -> tuple[str, Path, int, list[str], bool] | None:
+        """Validate an exec-like request: jail + blocklist + sandbox.
+
+        Returns (command, cwd, timeout, argv, sandboxed), or sends the
+        error response + audit entry and returns None. Used by /exec
+        and /jobs/start so both go through identical checks.
+        """
         command = payload.get("command", "")
         if not isinstance(command, str):
             self._send_json(400, {"ok": False, "error": "command must be a string"})
-            return
+            return None
         cwd_param = payload.get("cwd", ".")
         try:
             cwd = resolve_inside(self.config.workspace, str(cwd_param or "."))
         except ValueError as exc:
+            self._audit(endpoint, False, reason="cwd_escape")
             self._send_json(403, {"ok": False, "error": str(exc)})
-            self._audit("/exec", False, reason="cwd_escape")
-            return
+            return None
         try:
-            timeout = int(payload.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS))
+            timeout = int(payload.get("timeout_seconds", default_timeout))
         except (TypeError, ValueError):
-            timeout = DEFAULT_TIMEOUT_SECONDS
-        timeout = max(1, min(timeout, MAX_TIMEOUT_SECONDS))
+            timeout = default_timeout
+        timeout = max(1, min(timeout, max_timeout))
 
         blocked = check_command_blocked(
             command, self.config.workspace,
@@ -279,28 +323,102 @@ class HydraHandler(BaseHTTPRequestHandler):
         )
         audit_cmd = command[:200]
         if blocked:
+            self._audit(endpoint, False, reason="blocked",
+                        command_preview=audit_cmd,
+                        command_len=len(command))
             self._send_json(403, {
                 "ok": False, "error": blocked, "blocked": True,
             })
-            self._audit("/exec", False, reason="blocked",
-                        command_preview=audit_cmd,
-                        command_len=len(command))
-            return
+            return None
 
-        # Scrubbed environment: HYDRA secrets never reach the child.
-        env = {
-            k: v for k, v in os.environ.items()
-            if not k.startswith("HYDRA_")
-        }
-        env.setdefault("TERM", "dumb")
-        result = _run_command(command, cwd, timeout, env)
-        self._send_json(200, {"ok": True, **result})
-        self._audit("/exec", True, command_preview=audit_cmd,
-                    command_len=len(command),
+        sandboxed = bool(payload.get("sandbox", False))
+        if sandboxed:
+            no_network = bool(payload.get("sandbox_no_network", True))
+            try:
+                argv = build_bwrap_argv(
+                    command, self.config.workspace, cwd,
+                    no_network=no_network)
+            except SandboxUnavailableError as exc:
+                self._audit(endpoint, False, reason="sandbox_unavailable",
+                            command_preview=audit_cmd,
+                            command_len=len(command))
+                self._send_json(501, {"ok": False, "error": str(exc)})
+                return None
+        else:
+            argv = ["/bin/sh", "-c", command]
+        return command, cwd, timeout, argv, sandboxed
+
+    def _handle_exec(self, payload: dict) -> None:
+        prepared = self._prepare_command(
+            payload, "/exec", MAX_TIMEOUT_SECONDS, DEFAULT_TIMEOUT_SECONDS)
+        if prepared is None:
+            return
+        command, cwd, timeout, argv, sandboxed = prepared
+        result = _run_command(argv, cwd, timeout, self._scrubbed_env())
+        self._audit("/exec", True, command_preview=command[:200],
+                    command_len=len(command), sandboxed=sandboxed,
                     returncode=result["returncode"],
                     timed_out=result["timed_out"],
                     stdout_len=len(result["stdout"]),
                     stderr_len=len(result["stderr"]))
+        self._send_json(200, {"ok": True, "sandboxed": sandboxed, **result})
+
+    # -- background jobs ---------------------------------------------------
+
+    def _handle_jobs_start(self, payload: dict) -> None:
+        prepared = self._prepare_command(
+            payload, "/jobs/start", MAX_JOB_TIMEOUT_SECONDS,
+            DEFAULT_JOB_TIMEOUT_SECONDS)
+        if prepared is None:
+            return
+        command, cwd, timeout, argv, sandboxed = prepared
+        try:
+            job = self.jobs.start(
+                argv, command, cwd, self._scrubbed_env(),
+                timeout_seconds=timeout, sandboxed=sandboxed)
+        except RuntimeError as exc:
+            self._audit("/jobs/start", False, reason="too_many_jobs")
+            self._send_json(429, {"ok": False, "error": str(exc)})
+            return
+        self._audit("/jobs/start", True, job_id=job.job_id,
+                    command_preview=command[:200],
+                    command_len=len(command), sandboxed=sandboxed)
+        self._send_json(200, {
+            "ok": True, "job_id": job.job_id, "status": "running",
+            "sandboxed": sandboxed, "timeout_seconds": timeout,
+        })
+
+    def _handle_jobs_poll(self, payload: dict) -> None:
+        job_id = str(payload.get("job_id", ""))
+        try:
+            offset = int(payload.get("offset", 0))
+        except (TypeError, ValueError):
+            offset = 0
+        job = self.jobs.get(job_id)
+        if job is None:
+            self._send_json(404, {"ok": False, "error": "unknown job_id"})
+            return
+        snapshot = job.snapshot(stdout_offset=offset)
+        self._audit("/jobs/poll", True, job_id=job_id,
+                    status=snapshot["status"])
+        self._send_json(200, {"ok": True, **snapshot})
+
+    def _handle_jobs_kill(self, payload: dict) -> None:
+        job_id = str(payload.get("job_id", ""))
+        killed, job = self.jobs.kill(job_id)
+        if job is None:
+            self._send_json(404, {"ok": False, "error": "unknown job_id"})
+            return
+        self._audit("/jobs/kill", True, job_id=job_id, killed=killed)
+        self._send_json(200, {
+            "ok": True, "job_id": job_id, "killed": killed,
+            "status": job.status, "returncode": job.returncode,
+        })
+
+    def _handle_jobs_list(self, payload: dict) -> None:
+        jobs = self.jobs.list_jobs()
+        self._audit("/jobs/list", True, count=len(jobs))
+        self._send_json(200, {"ok": True, "jobs": jobs, "count": len(jobs)})
 
     def _handle_read(self, payload: dict) -> None:
         rel = str(payload.get("path", ""))
@@ -309,29 +427,64 @@ class HydraHandler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             max_bytes = MAX_OUTPUT_BYTES
         max_bytes = max(1, min(max_bytes, MAX_REQUEST_BYTES))
+        start_line = payload.get("start_line")
+        end_line = payload.get("end_line")
+        if start_line is not None or end_line is not None:
+            try:
+                start_line = int(start_line if start_line is not None else 1)
+                end_line = int(end_line) if end_line is not None else None
+            except (TypeError, ValueError):
+                self._send_json(400, {
+                    "ok": False,
+                    "error": "start_line/end_line must be integers"})
+                return
+            if start_line < 1 or (end_line is not None and end_line < start_line):
+                self._send_json(400, {
+                    "ok": False,
+                    "error": "line range must satisfy 1 <= start_line <= end_line"})
+                return
         try:
             path, _ro = resolve_readable(
                 self.config.workspace, rel, self.config.read_only_paths
             )
         except ValueError as exc:
-            self._send_json(403, {"ok": False, "error": str(exc)})
             self._audit("/read", False, reason="path_escape", path=rel[:256])
+            self._send_json(403, {"ok": False, "error": str(exc)})
             return
         if not path.is_file():
-            self._send_json(404, {"ok": False, "error": "not a file"})
             self._audit("/read", False, reason="not_found", path=rel[:256])
+            self._send_json(404, {"ok": False, "error": "not a file"})
             return
         data = path.read_bytes()[: max_bytes + 1]
         truncated = len(data) > max_bytes
         data = data[:max_bytes]
         content = data.decode("utf-8", errors="replace")
-        self._send_json(200, {
+        response: dict = {
             "ok": True, "path": rel, "content": content,
             "truncated": truncated, "size": path.stat().st_size,
             "encoding": "utf-8-replace",
-        })
+        }
+        if start_line is not None or end_line is not None:
+            lines = content.split("\n")
+            if content.endswith("\n"):
+                lines = lines[:-1]  # trailing "" is the terminator
+            total_lines = len(lines) if not truncated else None
+            lo = start_line or 1
+            hi = end_line if end_line is not None else len(lines)
+            selected = lines[lo - 1:hi]
+            ranged = "\n".join(selected)
+            if selected and (hi < len(lines) or content.endswith("\n")):
+                ranged += "\n"
+            response.update({
+                "content": ranged,
+                "start_line": lo,
+                "end_line": lo + len(selected) - 1 if selected else lo - 1,
+                "lines_returned": len(selected),
+                "total_lines": total_lines,
+            })
         self._audit("/read", True, path=rel[:256], bytes_read=len(data),
                     sha256=sha256_prefix(data))
+        self._send_json(200, response)
 
     def _handle_write(self, payload: dict) -> None:
         rel = str(payload.get("path", ""))
@@ -346,8 +499,8 @@ class HydraHandler(BaseHTTPRequestHandler):
         try:
             path = resolve_inside(self.config.workspace, rel)
         except ValueError as exc:
-            self._send_json(403, {"ok": False, "error": str(exc)})
             self._audit("/write", False, reason="path_escape", path=rel[:256])
+            self._send_json(403, {"ok": False, "error": str(exc)})
             return
         if path.is_dir():
             self._send_json(400, {"ok": False, "error": "path is a directory"})
@@ -359,12 +512,102 @@ class HydraHandler(BaseHTTPRequestHandler):
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "a" if mode == "append" else "w", encoding="utf-8") as fh:
             fh.write(content)
-        self._send_json(200, {
-            "ok": True, "path": rel, "bytes_written": len(data), "mode": mode,
-        })
         self._audit("/write", True, path=rel[:256],
                     bytes_written=len(data), mode=mode,
                     sha256=sha256_prefix(data))
+        self._send_json(200, {
+            "ok": True, "path": rel, "bytes_written": len(data), "mode": mode,
+        })
+
+    def _handle_edit(self, payload: dict) -> None:
+        """Exact-string patch: replace old_string with new_string.
+
+        Fails on zero matches (400) and on ambiguous matches (409)
+        unless replace_all is true. dry_run reports what would change
+        without writing. Workspace jail only (never read-only paths).
+        """
+        rel = str(payload.get("path", ""))
+        old_string = payload.get("old_string", "")
+        new_string = payload.get("new_string", "")
+        if not isinstance(old_string, str) or not isinstance(new_string, str):
+            self._send_json(400, {
+                "ok": False,
+                "error": "old_string and new_string must be strings"})
+            return
+        if old_string == "":
+            self._send_json(400, {
+                "ok": False, "error": "old_string must not be empty"})
+            return
+        dry_run = bool(payload.get("dry_run", False))
+        replace_all = bool(payload.get("replace_all", False))
+        try:
+            path = resolve_inside(self.config.workspace, rel)
+        except ValueError as exc:
+            self._audit("/edit", False, reason="path_escape", path=rel[:256])
+            self._send_json(403, {"ok": False, "error": str(exc)})
+            return
+        if not path.is_file():
+            self._audit("/edit", False, reason="not_found", path=rel[:256])
+            self._send_json(404, {"ok": False, "error": "not a file"})
+            return
+        raw = path.read_bytes()
+        try:
+            content = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            self._send_json(400, {
+                "ok": False,
+                "error": "file is not valid UTF-8; /edit only handles text"})
+            return
+        matches = content.count(old_string)
+        if matches == 0:
+            self._audit("/edit", False, reason="no_match", path=rel[:256])
+            self._send_json(400, {
+                "ok": False, "error": "old_string not found in file"})
+            return
+        if matches > 1 and not replace_all:
+            self._audit("/edit", False, reason="ambiguous",
+                        path=rel[:256], matches=matches)
+            self._send_json(409, {
+                "ok": False,
+                "error": f"ambiguous: old_string matches {matches} times; "
+                         "make it unique or pass replace_all=true",
+                "matches": matches,
+            })
+            return
+        replaced = matches if replace_all else 1
+        new_content = content.replace(old_string, new_string,
+                                      -1 if replace_all else 1)
+        # Small context preview around the first match, so the caller
+        # can confirm the right spot (bounded; never the whole file).
+        first = content.find(old_string)
+        lo = max(0, first - 80)
+        hi = min(len(content), first + len(old_string) + 80)
+        preview_before = content[lo:hi]
+        preview_after = new_content[lo:lo + len(preview_before)
+                                    + len(new_string) - len(old_string)]
+        if dry_run:
+            self._audit("/edit", True, path=rel[:256], dry_run=True,
+                        matches=matches)
+            self._send_json(200, {
+                "ok": True, "path": rel, "dry_run": True,
+                "matches": matches, "would_replace": replaced,
+                "bytes_before": len(raw),
+                "bytes_after": len(new_content.encode("utf-8")),
+                "preview_before": preview_before,
+                "preview_after": preview_after,
+            })
+            return
+        data = new_content.encode("utf-8")
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(new_content)
+        self._audit("/edit", True, path=rel[:256], matches=matches,
+                    replaced=replaced, bytes_written=len(data),
+                    sha256=sha256_prefix(data))
+        self._send_json(200, {
+            "ok": True, "path": rel, "dry_run": False,
+            "matches": matches, "replaced": replaced,
+            "bytes_written": len(data),
+        })
 
     def _handle_list(self, payload: dict) -> None:
         rel = str(payload.get("path", ".") or ".")
@@ -374,8 +617,8 @@ class HydraHandler(BaseHTTPRequestHandler):
                 self.config.workspace, rel, self.config.read_only_paths
             )
         except ValueError as exc:
-            self._send_json(403, {"ok": False, "error": str(exc)})
             self._audit("/list", False, reason="path_escape", path=rel[:256])
+            self._send_json(403, {"ok": False, "error": str(exc)})
             return
         if not path.exists():
             self._send_json(404, {"ok": False, "error": "path does not exist"})
@@ -389,12 +632,53 @@ class HydraHandler(BaseHTTPRequestHandler):
                 if len(entries) >= MAX_LIST_ENTRIES:
                     break
                 entries.append(_entry(child, path))
+        self._audit("/list", True, path=rel[:256],
+                    entries=len(entries), recursive=recursive)
         self._send_json(200, {
             "ok": True, "path": rel, "entries": entries,
             "truncated": len(entries) >= MAX_LIST_ENTRIES,
         })
-        self._audit("/list", True, path=rel[:256],
-                    entries=len(entries), recursive=recursive)
+
+    def _handle_search(self, payload: dict) -> None:
+        pattern = payload.get("pattern", "")
+        if not isinstance(pattern, str):
+            self._send_json(400, {"ok": False, "error": "pattern must be a string"})
+            return
+        rel = str(payload.get("path", ".") or ".")
+        try:
+            path, _ro = resolve_readable(
+                self.config.workspace, rel, self.config.read_only_paths
+            )
+        except ValueError as exc:
+            self._audit("/search", False, reason="path_escape", path=rel[:256])
+            self._send_json(403, {"ok": False, "error": str(exc)})
+            return
+        if not path.exists():
+            self._send_json(404, {"ok": False, "error": "path does not exist"})
+            return
+        try:
+            max_results = int(payload.get("max_results", 100))
+        except (TypeError, ValueError):
+            max_results = 100
+        try:
+            result = run_search(
+                pattern, path,
+                glob=payload.get("glob"),
+                fixed_strings=bool(payload.get("fixed_strings", False)),
+                case_sensitive=bool(payload.get("case_sensitive", True)),
+                max_results=max_results,
+            )
+        except SearchError as exc:
+            self._audit("/search", False, reason="search_error",
+                        pattern_len=len(pattern))
+            self._send_json(400, {"ok": False, "error": str(exc)})
+            return
+        self._audit("/search", True, path=rel[:256],
+                    pattern_len=len(pattern),
+                    sha256=sha256_prefix(pattern.encode("utf-8")),
+                    backend=result["backend"],
+                    match_count=result["match_count"])
+        self._send_json(200, {"ok": True, **result})
 
     # -- memory endpoints --------------------------------------------------
 
@@ -414,10 +698,10 @@ class HydraHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._send_json(400, {"ok": False, "error": str(exc)})
             return
-        self._send_json(200, {"ok": True, "id": memory_id})
         self._audit("/memory/add", True, id=memory_id,
                     text_len=len(text),
                     sha256=sha256_prefix(text.encode("utf-8")))
+        self._send_json(200, {"ok": True, "id": memory_id})
 
     def _handle_memory_search(self, payload: dict) -> None:
         query = str(payload.get("query", ""))
@@ -426,10 +710,10 @@ class HydraHandler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             limit = 10
         result = self.store.search(query, limit=limit)
-        self._send_json(200, {"ok": True, **result})
         self._audit("/memory/search", True, query_len=len(query),
                     hits=len(result["results"]),
                     fts_available=result["fts_available"])
+        self._send_json(200, {"ok": True, **result})
 
     def _handle_graph_add(self, payload: dict) -> None:
         try:
@@ -442,11 +726,11 @@ class HydraHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._send_json(400, {"ok": False, "error": str(exc)})
             return
-        self._send_json(200, {"ok": True, "id": rel_id})
         self._audit("/memory/graph/add", True,
                     subject=str(payload.get("subject", ""))[:128],
                     predicate=str(payload.get("predicate", ""))[:128],
                     object=str(payload.get("object", ""))[:128])
+        self._send_json(200, {"ok": True, "id": rel_id})
 
     def _handle_graph_neighbors(self, payload: dict) -> None:
         entity = str(payload.get("entity", ""))
@@ -459,11 +743,139 @@ class HydraHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._send_json(400, {"ok": False, "error": str(exc)})
             return
+        self._audit("/memory/graph/neighbors", True,
+                    entity=entity[:128], neighbors=len(neighbors))
         self._send_json(200, {
             "ok": True, "entity": entity, "neighbors": neighbors,
         })
-        self._audit("/memory/graph/neighbors", True,
-                    entity=entity[:128], neighbors=len(neighbors))
+
+    def _handle_memory_delete(self, payload: dict) -> None:
+        if "id" in payload:
+            try:
+                memory_id = int(payload["id"])
+            except (TypeError, ValueError):
+                self._send_json(400, {"ok": False, "error": "id must be an integer"})
+                return
+            deleted = self.store.delete_memory(memory_id)
+            if not deleted:
+                self._send_json(404, {"ok": False, "error": "memory not found"})
+                return
+            self._audit("/memory/delete", True, id=memory_id)
+            self._send_json(200, {"ok": True, "deleted": True, "id": memory_id})
+            return
+        if "relation_id" in payload:
+            try:
+                relation_id = int(payload["relation_id"])
+            except (TypeError, ValueError):
+                self._send_json(400, {
+                    "ok": False, "error": "relation_id must be an integer"})
+                return
+            deleted = self.store.delete_relation(relation_id)
+            if not deleted:
+                self._send_json(404, {"ok": False, "error": "relation not found"})
+                return
+            self._audit("/memory/delete", True, relation_id=relation_id)
+            self._send_json(200, {
+                "ok": True, "deleted": True, "relation_id": relation_id})
+            return
+        self._send_json(400, {
+            "ok": False, "error": "pass id (memory) or relation_id"})
+        return
+
+    def _handle_memory_list(self, payload: dict) -> None:
+        try:
+            limit = int(payload.get("limit", 20))
+        except (TypeError, ValueError):
+            limit = 20
+        kind = payload.get("kind")
+        result = self.store.list_recent(
+            limit=limit, kind=str(kind) if kind else None)
+        self._audit("/memory/list", True, count=result["count"],
+                    total=result["total"])
+        self._send_json(200, {"ok": True, **result})
+
+    # -- GUI endpoints (best effort, Wayland/KDE) --------------------------
+
+    def _handle_screen_shot(self, payload: dict) -> None:
+        try:
+            result = take_screenshot()
+        except GuiUnavailableError as exc:
+            self._audit("/screen/shot", False, reason="gui_unavailable")
+            self._send_json(501, {"ok": False, "error": str(exc)})
+            return
+        png = result["png_bytes"]
+        save_to = payload.get("save_to")
+        if save_to is not None:
+            try:
+                path = resolve_inside(self.config.workspace, str(save_to))
+            except ValueError as exc:
+                self._audit("/screen/shot", False, reason="path_escape")
+                self._send_json(403, {"ok": False, "error": str(exc)})
+                return
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(png)
+            self._audit("/screen/shot", True, backend=result["backend"],
+                        bytes=len(png), path=str(save_to)[:256])
+            self._send_json(200, {
+                "ok": True, "path": str(save_to),
+                "backend": result["backend"], "width": result["width"],
+                "height": result["height"], "bytes": len(png),
+            })
+            return
+        self._audit("/screen/shot", True, backend=result["backend"],
+                    bytes=len(png))
+        self._send_json(200, {
+            "ok": True, "format": "png",
+            "data_base64": base64.b64encode(png).decode("ascii"),
+            "backend": result["backend"], "width": result["width"],
+            "height": result["height"], "bytes": len(png),
+        })
+
+    def _handle_input_move(self, payload: dict) -> None:
+        try:
+            result = input_move(payload.get("x"), payload.get("y"))
+        except GuiInputError as exc:
+            self._send_json(400, {"ok": False, "error": str(exc)})
+            return
+        except GuiUnavailableError as exc:
+            self._audit("/input/move", False, reason="gui_unavailable")
+            self._send_json(501, {"ok": False, "error": str(exc)})
+            return
+        self._audit("/input/move", True, x=result["x"], y=result["y"])
+        self._send_json(200, result)
+
+    def _handle_input_click(self, payload: dict) -> None:
+        try:
+            result = input_click(
+                payload.get("x"), payload.get("y"),
+                button=str(payload.get("button", "left")),
+                clicks=payload.get("clicks", 1))
+        except GuiInputError as exc:
+            self._send_json(400, {"ok": False, "error": str(exc)})
+            return
+        except GuiUnavailableError as exc:
+            self._audit("/input/click", False, reason="gui_unavailable")
+            self._send_json(501, {"ok": False, "error": str(exc)})
+            return
+        self._audit("/input/click", True, button=result["button"],
+                    clicks=result["clicks"])
+        self._send_json(200, result)
+
+    def _handle_input_type(self, payload: dict) -> None:
+        text = payload.get("text", "")
+        try:
+            result = input_type(text)
+        except GuiInputError as exc:
+            self._send_json(400, {"ok": False, "error": str(exc)})
+            return
+        except GuiUnavailableError as exc:
+            self._audit("/input/type", False, reason="gui_unavailable")
+            self._send_json(501, {"ok": False, "error": str(exc)})
+            return
+        # Never log typed text: length + hash only.
+        self._audit("/input/type", True, text_len=len(text),
+                    sha256=sha256_prefix(str(text).encode("utf-8")))
+        self._send_json(200, result)
 
     # -- shutdown ----------------------------------------------------------
 
@@ -473,8 +885,10 @@ class HydraHandler(BaseHTTPRequestHandler):
                 "ok": False, "error": "shutdown needs {\"confirm\": true}",
             })
             return
-        self._send_json(200, {"ok": True, "message": "shutting down"})
-        self._audit("/shutdown", True)
+        killed = self.jobs.kill_all()
+        self._audit("/shutdown", True, jobs_killed=killed)
+        self._send_json(200, {"ok": True, "message": "shutting down",
+                              "jobs_killed": killed})
         # Shut down from a thread: shutdown() blocks until serve_forever
         # returns, and we are inside a request handler thread.
         threading.Thread(target=self.server.shutdown, daemon=True).start()
@@ -501,16 +915,18 @@ def _entry(path: Path, root: Path) -> dict:
 
 
 def _run_command(
-    command: str, cwd: Path, timeout: int, env: dict[str, str]
+    argv: list[str], cwd: Path, timeout: int, env: dict[str, str]
 ) -> dict:
-    """Run one shell command with timeout + output truncation.
+    """Run one command (already blocklist-approved) with timeout +
+    output truncation.
 
-    Uses /bin/sh -c AFTER the blocklist has approved the command.
-    No TTY, stdin closed, own process group so a timeout kills the
-    whole pipeline (not just the shell).
+    ``argv`` is either ["/bin/sh", "-c", command] or a bwrap-wrapped
+    equivalent built by hydra.sandbox. No TTY, stdin closed, own
+    process group so a timeout kills the whole pipeline (not just
+    the shell).
     """
     proc = subprocess.Popen(
-        ["/bin/sh", "-c", command],
+        argv,
         cwd=str(cwd),
         env=env,
         stdin=subprocess.DEVNULL,
@@ -559,13 +975,18 @@ def make_server(config: Config, token: str) -> ThreadingHTTPServer:
     handler.token = token
     handler.audit = AuditLog(config.audit_path)
     handler.store = MemoryStore(config.db_path)
+    jobs = JobManager()
+    handler.jobs = jobs
+    # If the daemon process exits (Ctrl-C, shutdown), kill any running
+    # background jobs instead of orphaning them.
+    atexit.register(jobs.kill_all)
     return ThreadingHTTPServer((config.bind, config.port), handler)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="hydra",
-        description="HYDRA v0.1 dumb-executor daemon (no model, no network calls).",
+        description="HYDRA v0.2 dumb-executor daemon (no model, no network calls).",
     )
     parser.add_argument("--bind", default=None,
                         help=f"bind address (default {DEFAULT_BIND})")
@@ -604,7 +1025,7 @@ def main(argv: list[str] | None = None) -> int:
 
     server = make_server(config, token)
     print("=" * 64)
-    print("HYDRA daemon v0.1  —  DUMB EXECUTOR ONLY")
+    print("HYDRA daemon v0.2  —  DUMB EXECUTOR ONLY")
     print("No model. No Ollama. No LLM calls. Mikey (cloud) is the brain.")
     print("=" * 64)
     print(f"Listening on  http://{config.bind}:{config.port}")

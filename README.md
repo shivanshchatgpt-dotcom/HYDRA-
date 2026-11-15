@@ -1,9 +1,10 @@
-# HYDRA v0.1 — Laptop Harness (Tailscale + Dumb Daemon)
+# HYDRA v0.2 — Laptop Harness (Tailscale + Dumb Daemon)
 
 > **Mikey (in the cloud) is the brain. This daemon is only the body.**
 > The daemon never thinks, never calls a model, never goes on the internet.
-> It only runs the exact file / shell / memory operations Mikey asks for,
-> inside one workspace folder, with a blocklist and an audit log.
+> It only runs the exact file / shell / memory / screen operations Mikey
+> asks for, inside one workspace folder (plus opt-in screen/input
+> control), with a blocklist and an audit log.
 
 ## What this is
 
@@ -12,10 +13,15 @@ KDE Plasma, Wayland) and gives Mikey a *virtual body* on that laptop:
 
 - Mikey talks to the daemon over HTTP+JSON, through the **private
   Tailscale network** (never the public internet by default).
-- The daemon executes: list files, read files, write files, run shell
-  commands, and store/search small long-term memories.
+- The daemon executes: list files, read files (whole or line ranges),
+  write files, patch-edit files, search code (ripgrep/grep), run shell
+  commands (sync or as background jobs, optionally in a bubblewrap
+  sandbox), store/search/delete small long-term memories, and — when
+  the optional GUI tools are installed — take screenshots and send
+  mouse/keyboard input.
 - Every request needs a bearer token, stays inside the workspace jail,
-  passes a visible command blocklist, and is written to an audit log.
+  passes a visible command blocklist, and is written to an audit log
+  (before the response is sent).
 
 ## What this is NOT
 
@@ -25,8 +31,9 @@ KDE Plasma, Wayland) and gives Mikey a *virtual body* on that laptop:
 - **No fallback.** If the daemon is stopped, or Tailscale is down, Mikey
   simply cannot reach the laptop. Nothing else takes over. That is the
   point: Baji stays in control with an obvious kill switch.
-- **No screen control.** v0.1 is files + shell only. No GUI automation,
-  no Wayland input control, no screenshots, no keystrokes.
+- **No browser control.** v0.2 has screenshots + mouse/keyboard input,
+  but no browser automation (no CDP, no DOM access). That is planned
+  future work; see `docs/ARCHITECTURE.md`.
 - **No telemetry, no auto-start, no public bind.** The daemon binds
   `127.0.0.1` by default, starts only when Baji starts it, and sends
   nothing anywhere on its own.
@@ -43,6 +50,9 @@ Baji's chat  ->  Mikey (cloud brain: thinks, plans, writes code)
                       |
                       +-- workspace jail: ~/hydra-workspace ONLY
                       +-- blocklist: sudo/rm -rf/curl|sh/... refused
+                      +-- optional bubblewrap sandbox for exec/jobs
+                      +-- GUI (opt-in tools): spectacle/grim screenshot,
+                      |   ydotool mouse/keyboard — see docs/GUI_SETUP.md
                       +-- audit log: ~/.local/share/hydra/audit.jsonl
                       +-- memory: ~/.local/share/hydra/memory.db
                           (SQLite FTS5 keyword + graph, NO vectors)
@@ -59,6 +69,11 @@ Threat model and revocation: see `SECURITY.md`.
 - Python 3.11+ (stdlib only, **no pip packages**).
 - Tailscale (only needed for Mikey to reach the laptop; localhost testing
   works without it).
+- Optional tools, each enabling one v0.2 feature (the daemon works
+  without them and returns a clear 501 naming the missing tool):
+  `ripgrep` (fast `/search`), `bubblewrap` (sandboxed exec),
+  `spectacle` or `grim` (screenshots), `ydotool` + `ydotoold`
+  (mouse/keyboard input). See `docs/GUI_SETUP.md` for exact setup.
 
 ## Setup (on the laptop, run by Baji)
 
@@ -84,6 +99,8 @@ In a second terminal, test it:
 curl http://127.0.0.1:8765/health
 python3 hydra_client.py list --path .
 python3 hydra_client.py exec --command "pwd && ls -la"
+python3 hydra_client.py search --pattern "TODO"
+python3 hydra_client.py screen-shot --save-to shots/shot.png
 ```
 
 To let Mikey reach it over Tailscale, find the laptop's Tailscale IP and
@@ -112,6 +129,19 @@ Any one of these stops Mikey's access completely:
 To fully revoke: stop the daemon, rotate the token
 (`python3 scripts/generate_token.py --force`), and optionally delete
 `~/.local/share/hydra/`. See `SECURITY.md`.
+
+## What's new in v0.2
+
+- Patch edits (`/edit`), line-range reads, code search (`/search`).
+- Background jobs (`/jobs/start|poll|kill|list`) with output polling.
+- Opt-in bubblewrap sandbox for exec/jobs (`"sandbox": true`).
+- Memory delete + list-recent (`/memory/delete`, `/memory/list`).
+- Best-effort GUI: `/screen/shot`, `/input/move|click|type`.
+- Audit entries are now written *before* the response is sent, so a
+  returned result is always already logged.
+
+Full list: see `CHANGELOG.md`. What still needs live verification on
+the laptop (GUI endpoints, bubblewrap): see `docs/GUI_SETUP.md`.
 
 ## Memory (small RAG + graph, keyword only)
 
@@ -151,16 +181,23 @@ repurposed into this harness). Nothing was deleted from git history.
 
 | Path | What it is |
 |---|---|
-| `hydra/daemon.py` | HTTP API + exec/read/write/list/shutdown |
+| `hydra/daemon.py` | HTTP API + exec/read/write/edit/search/jobs/GUI/shutdown |
 | `hydra/security.py` | Workspace jail + command blocklist + token checks |
 | `hydra/memory_store.py` | SQLite FTS5 + graph memory (no model) |
 | `hydra/audit.py` | Append-only JSONL audit log |
+| `hydra/search.py` | ripgrep/grep workspace search |
+| `hydra/jobs.py` | Background job manager (start/poll/kill) |
+| `hydra/sandbox.py` | bubblewrap argv builder (never silently unsandboxed) |
+| `hydra/gui.py` | Screenshots (spectacle/grim/portal) + ydotool input |
 | `hydra_client.py` | Stdlib test client |
 | `scripts/generate_token.py` | 0600 token generator |
 | `scripts/install-arch.sh` | Arch setup checks + dirs + token |
 | `scripts/start-daemon.sh` | Foreground start (manual only) |
 | `systemd/hydra.service` | Opt-in user unit (NOT enabled by setup) |
 | `config.example.json` | Example config (no secrets in it) |
-| `tests/test_daemon.py` | Stdlib unittest suite |
+| `tests/test_daemon.py` | v0.1 stdlib unittest suite (30 tests) |
+| `tests/test_v02.py` | v0.2 stdlib unittest suite |
 | `docs/ARCHITECTURE.md` | Design + endpoint examples |
+| `docs/GUI_SETUP.md` | GUI/sandbox laptop setup + live verification |
+| `CHANGELOG.md` | Version history |
 | `SECURITY.md` | Threat model + rotation + revocation |

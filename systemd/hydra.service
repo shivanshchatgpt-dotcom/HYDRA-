@@ -18,10 +18,18 @@
 # cloned it elsewhere, edit WorkingDirectory and ExecStart below.
 # NOTE: It binds localhost only. For Tailscale access, edit ExecStart
 # to add --bind <TAILSCALE-IP>, or keep localhost-only and start the
-# daemon manually when Mikey needs access (recommended for v0.1).
+# daemon manually when Mikey needs access (recommended).
+# NOTE (v0.2 GUI endpoints): /screen/shot and /input/* need the
+# daemon to run INSIDE the graphical session (WAYLAND_DISPLAY set,
+# access to the session bus and ydotoold). A user unit started at
+# login usually has the session bus, but WAYLAND_DISPLAY is only set
+# for units started after the Plasma session is up. If the GUI
+# endpoints return "no graphical session", start the daemon from a
+# Konsole window inside the KDE session instead (see docs/GUI_SETUP.md).
+# The file/shell/search/job endpoints work fine from this unit either way.
 
 [Unit]
-Description=HYDRA v0.1 dumb-executor daemon (no model)
+Description=HYDRA v0.2 dumb-executor daemon (no model)
 After=network-online.target
 Wants=network-online.target
 

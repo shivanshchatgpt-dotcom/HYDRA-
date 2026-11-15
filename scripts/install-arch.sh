@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# HYDRA v0.1 Arch Linux setup (Baji's laptop: Arch + KDE Plasma + Wayland).
+# HYDRA v0.2 Arch Linux setup (Baji's laptop: Arch + KDE Plasma + Wayland).
 #
 # What this script DOES:
 #   * checks python3 (>= 3.11) and tailscale presence (read-only checks)
+#   * checks the OPTIONAL v0.2 tools (ripgrep, bubblewrap, ydotool,
+#     spectacle/grim) and prints install guidance for the missing ones
 #   * creates ~/hydra-workspace and ~/.local/share/hydra
 #   * generates a 0600 bearer token file if one does not exist
 #   * prints exact next steps (Tailscale login, start, test)
@@ -15,8 +17,10 @@
 #     manual, opt-in step; see README.md)
 #   * never touches the network, never phones home
 #
-# v0.1 scope: files + shell inside the workspace only.
-# NO screen control, NO GUI automation, NO Wayland input control.
+# v0.2 scope: files + shell + patch edits + search + background jobs
+# inside the workspace, optional bubblewrap sandbox, and best-effort
+# GUI endpoints (screenshot + input) when the tools below are present.
+# NO browser control (future work, see docs/ARCHITECTURE.md).
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -24,7 +28,7 @@ WORKSPACE="${HYDRA_WORKSPACE:-$HOME/hydra-workspace}"
 DATA_DIR="${HYDRA_DATA_DIR:-$HOME/.local/share/hydra}"
 TOKEN_FILE="${HYDRA_TOKEN_FILE:-$DATA_DIR/token}"
 
-echo "=== HYDRA v0.1 setup (Arch Linux) ==="
+echo "=== HYDRA v0.2 setup (Arch Linux) ==="
 echo "Repo:      $REPO_DIR"
 echo "Workspace: $WORKSPACE"
 echo "Data dir:  $DATA_DIR"
@@ -55,13 +59,51 @@ else
 fi
 echo
 
-# 3. Directories.
+# 3. Optional v0.2 tools (read-only checks; install guidance only).
+# The daemon works without all of these; each missing tool only
+# disables the endpoints that need it, with a clear 501 error.
+echo "Optional v0.2 tools:"
+if command -v rg >/dev/null 2>&1; then
+  echo "  ripgrep (rg): found — /search uses it (fast path)"
+else
+  echo "  ripgrep (rg): NOT FOUND — /search falls back to grep (slower)."
+  echo "    To install it yourself: sudo pacman -S ripgrep"
+fi
+if command -v bwrap >/dev/null 2>&1; then
+  echo "  bubblewrap (bwrap): found — sandboxed exec available"
+else
+  echo "  bubblewrap (bwrap): NOT FOUND — sandboxed exec returns 501."
+  echo "    To install it yourself: sudo pacman -S bubblewrap"
+  echo "    (Needs unprivileged user namespaces; stock Arch kernels allow them.)"
+fi
+if command -v ydotool >/dev/null 2>&1; then
+  echo "  ydotool: found — /input endpoints available (needs ydotoold running)"
+  echo "    Start it yourself with: sudo systemctl enable --now ydotoold"
+  echo "    And add your user to the input group (one-time):"
+  echo "      sudo usermod -aG input \$USER   # then log out and back in"
+else
+  echo "  ydotool: NOT FOUND — /input endpoints return 501."
+  echo "    To install it yourself: sudo pacman -S ydotool"
+fi
+if command -v spectacle >/dev/null 2>&1; then
+  echo "  spectacle: found — /screen/shot primary backend"
+elif command -v grim >/dev/null 2>&1; then
+  echo "  grim: found — /screen/shot fallback backend"
+else
+  echo "  spectacle/grim: NOT FOUND — /screen/shot tries the xdg-desktop-portal"
+  echo "    path instead (needs a permission dialog the first time)."
+  echo "    To install spectacle yourself: sudo pacman -S spectacle"
+fi
+echo "See docs/GUI_SETUP.md for the full GUI/sandbox setup checklist."
+echo
+
+# 4. Directories.
 mkdir -p "$WORKSPACE" "$DATA_DIR" "$HOME/.config/hydra"
 chmod 700 "$DATA_DIR" || true
 echo "Created: $WORKSPACE"
 echo "Created: $DATA_DIR"
 
-# 4. Token (0600). Never printed, never overwritten here.
+# 5. Token (0600). Never printed, never overwritten here.
 if [ -f "$TOKEN_FILE" ]; then
   chmod 600 "$TOKEN_FILE"
   echo "Token file already exists (kept): $TOKEN_FILE"
@@ -70,7 +112,7 @@ else
 fi
 echo
 
-# 5. Config example (only if user has no config yet).
+# 6. Config example (only if user has no config yet).
 if [ ! -f "$HOME/.config/hydra/config.json" ]; then
   cp "$REPO_DIR/config.example.json" "$HOME/.config/hydra/config.json"
   echo "Copied example config to ~/.config/hydra/config.json (edit if needed)."
@@ -94,6 +136,10 @@ echo
 echo "4) Test from a second terminal:"
 echo "     curl http://127.0.0.1:8765/health"
 echo "     python3 hydra_client.py list --path ."
+echo "     python3 hydra_client.py search --pattern TODO"
+echo "     python3 hydra_client.py screen-shot --save-to shots/shot.png"
+echo "   (The last two need the optional tools above; without them"
+echo "    you get a clear error naming the missing tool.)"
 echo
 echo "5) Stop anytime with Ctrl-C in the daemon terminal."
 echo "   No auto-start is installed. See README.md for uninstall."
