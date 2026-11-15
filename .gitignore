@@ -1,0 +1,13 @@
+# HYDRA secrets / local state: NEVER commit these.
+token
+*.token
+hydra.db
+memory.db
+memory.db-wal
+memory.db-shm
+audit.jsonl
+__pycache__/
+*.pyc
+.hydra/
+hydra-workspace/
+config.json

@@ -1,0 +1,10 @@
+{
+    "_comment": "HYDRA v0.1 example config. Copy to ~/.config/hydra/config.json and edit. CLI flags and HYDRA_* env vars override these values. NEVER put the bearer token in this file.",
+    "allow_systemctl_manage": false,
+    "bind": "127.0.0.1",
+    "blocklist_extra": [],
+    "port": 8765,
+    "read_only_paths": [],
+    "token_file": "~/.local/share/hydra/token",
+    "workspace": "~/hydra-workspace"
+}

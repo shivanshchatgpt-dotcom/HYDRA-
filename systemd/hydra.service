@@ -1,0 +1,41 @@
+# HYDRA daemon — systemd USER unit (OPT-IN, NO auto-start by default)
+#
+# Install ONLY if you want the daemon to run as a user service.
+# The install script NEVER enables this. To install manually:
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp systemd/hydra.service ~/.config/systemd/user/hydra.service
+#   systemctl --user daemon-reload
+#   systemctl --user start hydra        # start now, once
+#   # Only if you REALLY want it on every login:
+#   systemctl --user enable hydra
+#
+# Stop:  systemctl --user stop hydra
+# Logs:  journalctl --user -u hydra
+# Remove: systemctl --user disable --now hydra; rm ~/.config/systemd/user/hydra.service
+#
+# NOTE: This unit assumes the repo lives at ~/hydra-harness. If you
+# cloned it elsewhere, edit WorkingDirectory and ExecStart below.
+# NOTE: It binds localhost only. For Tailscale access, edit ExecStart
+# to add --bind <TAILSCALE-IP>, or keep localhost-only and start the
+# daemon manually when Mikey needs access (recommended for v0.1).
+
+[Unit]
+Description=HYDRA v0.1 dumb-executor daemon (no model)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/hydra-harness
+ExecStart=/usr/bin/python3 -m hydra --bind 127.0.0.1 --port 8765
+Restart=no
+# Hardening: the daemon only needs the workspace + its data dir.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=%h/hydra-workspace %h/.local/share/hydra
+# The token file lives under %h/.local/share/hydra (writable above).
+
+[Install]
+WantedBy=default.target
