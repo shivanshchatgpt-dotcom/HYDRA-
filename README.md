@@ -36,6 +36,11 @@ KDE Plasma, Wayland) and gives Mikey a *virtual body* on that laptop:
 - Every request needs a bearer token, stays inside the workspace jail,
   passes a visible command blocklist, and is written to an audit log
   (before the response is sent).
+- **MCP hosts get the same body.** `python3 -m hydra.mcp_server` speaks
+  the Model Context Protocol on stdio and exposes 36 `hydra_*` tools
+  (files, shell, jobs, memory, screen, browser, video) as thin calls to
+  this same daemon — same token, jail, blocklist, audit. See
+  `docs/MCP_SETUP.md`.
 
 ## What this is NOT
 

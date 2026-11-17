@@ -48,6 +48,8 @@ hydra/tailscale.py     local `tailscale` CLI parsing: IP resolution
                        (CGNAT-validated, fail-closed), status JSON
                        summary with keys/peers dropped
 hydra/doctor.py        read-only self-checks: Tailscale, tools, disk
+hydra/mcp_server.py    stdio MCP adapter: 36 hydra_* tools -> same daemon
+                       routes (thin client, no new privileges)
                        floor, token file mode (stat only), workspace,
                        systemd unit, bind mode; fix hints, no fixes
 hydra_client.py        stdlib client (testing / manual use)

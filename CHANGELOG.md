@@ -3,6 +3,18 @@
 All notable changes. Versions follow the daemon's `VERSION` in
 `hydra/daemon.py` / `hydra/__init__.py`.
 
+## Unreleased
+
+Added:
+
+- `hydra/mcp_server.py`: a thin stdio MCP adapter that exposes the
+  daemon's audited endpoints as 36 `hydra_*` tools, so any MCP host
+  (Muse Code, Claude Code, Codex) can use HYDRA as its body. No new
+  privileges: every call is one HTTP+JSON request with the same
+  bearer token, workspace jail, blocklist, and audit log. Includes
+  `--selfcheck` (schema validation + daemon probe) and `--list-tools`.
+  See `docs/MCP_SETUP.md`.
+
 ## 0.4.0 — 2026-11-17
 
 Added:
