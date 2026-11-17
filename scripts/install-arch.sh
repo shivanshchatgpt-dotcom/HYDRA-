@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# HYDRA v0.3 Arch Linux setup (Baji's laptop: Arch + KDE Plasma + Wayland).
+# HYDRA v0.4 Arch Linux setup (Baji's laptop: Arch + KDE Plasma + Wayland).
 #
 # What this script DOES:
 #   * checks python3 (>= 3.11) and tailscale presence (read-only checks)
 #   * checks the OPTIONAL tools (ripgrep, bubblewrap, ydotool,
-#     spectacle/grim, Chrome/Chromium for CDP browser control) and
+#     spectacle/grim, Chrome/Chromium for CDP browser control,
+#     kdenlive/mlt/ffmpeg for headless video) and
 #     prints install guidance for the missing ones
 #   * creates ~/hydra-workspace and ~/.local/share/hydra
 #   * generates a 0600 bearer token file if one does not exist
@@ -20,11 +21,12 @@
 #     this script only PRINTS the commands — see README.md)
 #   * never touches the network, never phones home
 #
-# v0.3 scope: files + shell + patch edits + search + PERSISTENT and
+# v0.4 scope: files + shell + patch edits + search + PERSISTENT and
 # DETACHED background jobs inside the workspace, optional bubblewrap
 # sandbox, best-effort GUI endpoints (screenshot + input), read-only
-# system/git endpoints, and loopback-only CDP browser control when
-# Chrome is running with --remote-debugging-port (see docs/BROWSER_SETUP.md).
+# system/git endpoints, loopback-only CDP browser control when
+# Chrome is running with --remote-debugging-port (see docs/BROWSER_SETUP.md),
+# and headless video (MLT XML + melt, no GUI; see docs/VIDEO_SETUP.md).
 # NO agent loop, NO scheduling inside the daemon, NO model — Mikey in
 # the cloud is the brain; this daemon is only the body.
 set -euo pipefail
@@ -34,7 +36,7 @@ WORKSPACE="${HYDRA_WORKSPACE:-$HOME/hydra-workspace}"
 DATA_DIR="${HYDRA_DATA_DIR:-$HOME/.local/share/hydra}"
 TOKEN_FILE="${HYDRA_TOKEN_FILE:-$DATA_DIR/token}"
 
-echo "=== HYDRA v0.3 setup (Arch Linux) ==="
+echo "=== HYDRA v0.4 setup (Arch Linux) ==="
 echo "Repo:      $REPO_DIR"
 echo "Workspace: $WORKSPACE"
 echo "Data dir:  $DATA_DIR"
@@ -65,10 +67,10 @@ else
 fi
 echo
 
-# 3. Optional v0.3 tools (read-only checks; install guidance only).
+# 3. Optional v0.4 tools (read-only checks; install guidance only).
 # The daemon works without all of these; each missing tool only
 # disables the endpoints that need it, with a clear 501 error.
-echo "Optional v0.3 tools:"
+echo "Optional v0.4 tools:"
 if command -v rg >/dev/null 2>&1; then
   echo "  ripgrep (rg): found — /search uses it (fast path)"
 else
@@ -107,8 +109,28 @@ else
   echo "  Chrome/Chromium: NOT FOUND — /browser/* endpoints return 501."
   echo "    Install Chrome yourself (AUR: google-chrome) if you want them."
 fi
-echo "See docs/GUI_SETUP.md for the GUI/sandbox checklist and"
-echo "docs/BROWSER_SETUP.md for the Chrome debugging checklist."
+if command -v melt >/dev/null 2>&1; then
+  echo "  melt: found — /video/render/* endpoints available"
+else
+  echo "  melt: NOT FOUND — /video/render/* endpoints return 501."
+  echo "    To install it yourself: sudo pacman -S mlt"
+fi
+if command -v ffmpeg >/dev/null 2>&1 && command -v ffprobe >/dev/null 2>&1; then
+  echo "  ffmpeg/ffprobe: found — /video/probe and /video/preview available"
+else
+  echo "  ffmpeg/ffprobe: NOT FOUND — /video/probe and /video/preview return 501."
+  echo "    To install them yourself: sudo pacman -S ffmpeg"
+fi
+if command -v kdenlive >/dev/null 2>&1; then
+  echo "  kdenlive: found — you can open generated .mlt projects by hand"
+else
+  echo "  kdenlive: NOT FOUND — headless renders still work without it;"
+  echo "    install it yourself (sudo pacman -S kdenlive) only if you want"
+  echo "    to open projects in the Kdenlive GUI."
+fi
+echo "See docs/GUI_SETUP.md for the GUI/sandbox checklist,"
+echo "docs/BROWSER_SETUP.md for the Chrome debugging checklist, and"
+echo "docs/VIDEO_SETUP.md for the headless video checklist."
 echo
 
 # 4. Directories.
@@ -144,8 +166,12 @@ echo "     cd $REPO_DIR"
 echo "     ./scripts/start-daemon.sh"
 echo
 echo "3) To let Mikey reach it over Tailscale, stop it (Ctrl-C) and start:"
-echo "     ./scripts/start-daemon.sh --bind <TAILSCALE-IP> --port 8765"
-echo "   (Replace <TAILSCALE-IP> with the output of 'tailscale ip -4'.)"
+echo "     ./scripts/start-daemon.sh --bind tailscale"
+echo "   (The daemon resolves the laptop's current Tailscale IP itself"
+echo "    and refuses to start if Tailscale is down. The manual form,"
+echo "    ./scripts/start-daemon.sh --bind <TAILSCALE-IP>, still works;"
+echo "    see docs/TAILSCALE_AUTO.md. ./scripts/pair.sh prints a"
+echo "    read-only pairing card with the daemon URL.)"
 echo
 echo "4) Test from a second terminal:"
 echo "     curl http://127.0.0.1:8765/health"
@@ -174,3 +200,10 @@ echo "7) OPTIONAL browser control: start Chrome with remote debugging:"
 echo "     ./scripts/chrome-debug.sh"
 echo "   (Uses your normal profile; never kills a running Chrome.)"
 echo "   Then: python3 hydra_client.py browser-status"
+echo
+echo "8) Tailscale setup helpers (v0.4, see docs/TAILSCALE_AUTO.md):"
+echo "     ./scripts/setup-tailscale.sh   # checks + prints setup commands"
+echo "     ./scripts/pair.sh              # read-only pairing card"
+echo "   And once the daemon is running, Mikey can ask it for a"
+echo "   self-check (POST /system/doctor) and Tailscale state"
+echo "   (POST /system/tailscale) — both read-only, both need the token."

@@ -3,6 +3,159 @@
 All notable changes. Versions follow the daemon's `VERSION` in
 `hydra/daemon.py` / `hydra/__init__.py`.
 
+## 0.4.0 — 2026-11-17
+
+Added:
+
+- Headless video pipeline (`hydra/video.py`, stdlib only): ffprobe
+  media probing (duration/streams/resolution/fps/codec, parsed from
+  fixed-argv JSON output), a validated timeline model (multi-track
+  video/audio clips with in/out trims, still images, pango text
+  titles, crossfade/mix transitions between adjacent tracks,
+  per-clip volume converted to dB for MLT's volume filter, SRT/VTT
+  subtitle sidecar), MLT XML generation with `xml.etree`
+  (profile/producers/playlists/`main` tractor, blanks for gaps),
+  `melt` rendering with fixed consumer arguments (libx264 CRF 18 +
+  AAC 192k), ffmpeg subtitle burn as a post-pass (a burn failure
+  keeps the unburned render and records a warning), output
+  validation (video stream + duration within max(0.5s, 2%)),
+  ffmpeg PNG preview frames (magic-byte verified), and asset
+  manifests (`manifest.json`: SHA256 + probe + source/license note
+  per asset; URLs are provenance notes only — the daemon never
+  downloads anything and has no auto-scraper). Profiles:
+  `1080p30`, `1080p30-vertical`, `720p30`, `1080p25`. No GUI is
+  ever opened; Kdenlive itself is only needed to open projects by
+  hand.
+- Long-horizon video workflows (`hydra/workflows.py`): a fixed
+  six-step DAG (ingest -> probe -> timeline -> render -> validate
+  -> preview) checkpointed in a separate SQLite database
+  (`video.db`, same WAL + row pattern as `jobs.db`). Workflows
+  interrupted by a daemon restart are marked `interrupted` (any
+  still-living recorded melt process is killed) and resume
+  explicitly via `/video/render/poll` with `{"resume": true}` —
+  completed steps are never re-run, and nothing ever auto-resumes
+  (no scheduler, no agent loop). Transient render failures retry
+  up to 3 times with backoff (2s, 8s); permanent failures (bad
+  timeline, missing tool, disk guard) fail immediately. One melt
+  render at a time (single-render lock; later workflows wait in
+  `queued`). Render timeout default 4h, max 24h.
+- Disk guard: renders are refused (HTTP 507) when free space is
+  below a conservative estimate (planning bitrate x duration x 2.0
+  safety factor + 100 MB headroom), checked at start and again
+  right before melt runs.
+- New endpoints, all auth + audit + jail checked like existing
+  routes: `POST /video/probe`, `/video/project/create`,
+  `/video/render/start` (with `dry_run`, which validates + estimates
+  without creating a workflow; melt missing returns 501 before any
+  workflow is created), `/video/render/poll` (progress percent +
+  current step + per-step attempts/errors; `resume` flag),
+  `/video/preview` (workspace file paths only, never image bytes),
+  `/video/list` (projects + workflows + `render_busy`). `GET
+  /health` gains `video_tools` presence booleans (kdenlive/melt/
+  ffmpeg/ffprobe, no version guessing). `/shutdown` now also
+  interrupts running video workflows (response adds
+  `workflows_interrupted`; interrupted workflows stay resumable).
+- `docs/VIDEO_SETUP.md`: Arch install (`sudo pacman -S kdenlive
+  mlt ffmpeg`), the six steps, resume rules, disk-space guidance,
+  and the live laptop verification checklist.
+- 80 new video tests: ffprobe parsing with fake ffprobe
+  JSON/binary, timeline validation, MLT XML generation parsed
+  back with ElementTree, manifest/disk-guard units, workflow
+  checkpoint/resume/retry/queue-exclusivity tests, and HTTP
+  end-to-end tests including 401s, path-escape rejection, honest
+  501s without melt, and a full render against a fake melt (real
+  ffmpeg/ffprobe) proving the HTTP -> workflow -> render ->
+  validate -> preview chain.
+- Tailscale-auto, folded into the same 0.4.0 release (no version
+  bump): bind mode `tailscale` (`hydra/tailscale.py`, stdlib
+  only) resolving the current Tailscale IPv4 via local
+  `tailscale ip -4` (fixed argv, scrubbed env, CGNAT-validated)
+  and failing closed with a clear error when Tailscale is down,
+  missing, or returns no address; default bind unchanged
+  (`127.0.0.1`) and the same loopback + 100.64.0.0/10 validation
+  applies after resolution. Read-only endpoints, all auth + audit
+  like `/system/info`: `POST /system/tailscale` (connected,
+  backend state, self hostname/IP, version, peer count only — no
+  node keys, no peer list; 501 when the binary is missing, 502
+  when tailscaled is down; a parseable NeedsLogin state is a
+  normal 200 with `connected: false`) and `POST /system/doctor`
+  (`hydra/doctor.py`: tailscale/tools/disk-floor/token-mode/
+  workspace/systemd-unit/bind checks with fix hints, never
+  auto-fix, token contents never read). `GET /health` gains
+  `tailscale` presence/connection/IP fields that degrade honestly
+  and never fail the health check. Laptop scripts: `scripts/pair.sh`
+  (read-only pairing card, token SHA-256 fingerprint first 12
+  chars only, never the token value), `scripts/setup-tailscale.sh`
+  (checks + printed commands only, never executes sudo; disk
+  warning refusing to suggest a full `pacman -Syu` when space is
+  low; opt-in `--enable-autostart` runs user-scope
+  `systemctl --user` commands only when the unit file is already
+  installed), and `scripts/kill-switch.sh` (local only, no daemon
+  endpoint; deletes token + data only with explicit `--confirm`
+  after printing exactly what will be deleted, with guards against
+  unsafe data-dir values). `docs/TAILSCALE_AUTO.md` documents the
+  setup flow, pairing card, doctor output, kill switch, and the
+  honest limits: the per-session token handoff is NOT removed, no
+  relay/Cloudflare/polling/HTTPS/public bind/credential storage/
+  auto-update is added, the laptop must still be on and awake,
+  and MagicDNS/Tailscale Serve are listed only as unverified
+  future investigation.
+- 47 new tests (268 total, 1 skipped for missing `bwrap`):
+  Tailscale bind resolution + fail-closed with a fake `tailscale`
+  binary on PATH (up/down/bad-IP/empty/missing), status-JSON
+  parsing with keys/peers dropped, doctor checks + disk-floor
+  thresholds + the no-secret guarantee (token value, node keys,
+  and peer identities asserted absent from every response, report,
+  script output, and audit entry), HTTP end-to-end tests for both
+  new endpoints including 401s/501/502 and the `/health` fields,
+  and script tests (pair fingerprint prefix only, setup script
+  sudo-only-in-printed-text + autostart flag behaviour + low-disk
+  warning, kill-switch confirm/guard behaviour).
+
+Changed:
+
+- `config.example.json`: version comment bumped; no new keys (video
+  settings are per-call, like browser control). The comment now
+  also notes the `tailscale` bind value.
+- Error shape gains HTTP 507 for disk-guard refusals; HTTP 409 now
+  also covers existing projects and unresumable workflows. HTTP
+  501 now also covers a missing `tailscale` binary (on
+  `/system/tailscale`) and HTTP 502 also covers a down tailscaled
+  or unparseable status output.
+
+Safety invariants kept from v0.1/v0.2/v0.3 (unchanged):
+
+- Bind rules, 0600 token file + constant-time compare, workspace
+  jail with symlink resolution, blocklist failing closed, audit log
+  with hashes/lengths only, stdlib-only, zero outbound calls from
+  the daemon, no model, no telemetry, no agent loop, no scheduling
+  inside the daemon, no credential handling of any kind. Video
+  subprocesses (ffprobe/melt/ffmpeg) run with fixed argument lists
+  (no shell, no caller-supplied flags).
+
+Deliberately NOT added: GUI automation for video, `.kdenlive`
+project generation, keyframed effects/colour grading, media
+downloading or stock search, automatic resume, parallel renders,
+CPU/RAM limits on melt, `hydra_client.py` subcommands for `/video/*`.
+
+Not verified in this release (needs Baji's laptop — see
+`docs/VIDEO_SETUP.md` and `docs/TAILSCALE_AUTO.md`): real melt renders of HYDRA-generated MLT,
+crossfade rendering (luma transition carries no resource file),
+pango title rendering, volume audibility, subtitle burn output,
+Kdenlive round-trip (opening `project.mlt` by hand), interruption
++ resume across a real daemon restart on the laptop, and the
+disk-guard refusal on a nearly-full disk. The suite proves the
+plumbing against fake melt + real ffmpeg/ffprobe only; no
+Kdenlive/melt exists on the build VM. Also unverified:
+Tailscale-auto against a real tailscaled and systemd user
+session (no tailscaled/systemd user session on the build VM) —
+`--bind tailscale` startup, `/system/tailscale` and
+`/system/doctor` against real state, the pairing card, the
+setup/kill-switch scripts, and the unit with `--bind tailscale`
+after a reboot; see the checklist in `docs/TAILSCALE_AUTO.md`.
+The Tailscale-auto suite proves the logic against fake
+`tailscale`/`systemctl` binaries only.
+
 ## 0.3.0 — 2026-11-16
 
 Added:

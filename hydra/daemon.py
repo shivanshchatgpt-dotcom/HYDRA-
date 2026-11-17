@@ -1,4 +1,4 @@
-"""HYDRA daemon v0.3: a DUMB executor for Baji's laptop.
+"""HYDRA daemon v0.4: a DUMB executor for Baji's laptop.
 
 NO model. NO Ollama. NO LLM API calls. NO internet calls.
 Mikey (in the cloud) is the brain. This daemon is only the body:
@@ -49,6 +49,7 @@ from .browser import (
     browser_type,
     validate_loopback,
 )
+from .doctor import run_doctor
 from .gui import (
     GuiInputError,
     GuiUnavailableError,
@@ -71,8 +72,29 @@ from .security import (
     token_matches,
 )
 from .sysinfo import GitUnavailableError, git_status, system_info
+from .tailscale import (
+    TailscaleError,
+    TailscaleUnavailableError,
+    resolve_tailscale_ip,
+    tailscale_status,
+    tailscale_summary,
+)
+from .video import (
+    DiskSpaceError,
+    VideoError,
+    VideoUnavailableError,
+    check_disk_space,
+    create_project,
+    estimate_output_bytes,
+    extract_frames,
+    list_projects,
+    load_project,
+    probe_media,
+    video_tools,
+)
+from .workflows import WorkflowError, WorkflowManager
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 DEFAULT_BIND = "127.0.0.1"
 DEFAULT_PORT = 8765
 DEFAULT_TIMEOUT_SECONDS = 30
@@ -118,6 +140,18 @@ class Config:
             args.bind, "HYDRA_BIND", "bind", DEFAULT_BIND))
         self.port = int(pick(
             args.port, "HYDRA_PORT", "port", DEFAULT_PORT))
+        # Bind mode "tailscale": resolve the current Tailscale IPv4
+        # via the local `tailscale ip -4` CLI (no sudo, no network
+        # call from the daemon). Fails closed: if Tailscale is down
+        # or returns no usable IP, startup refuses (see main()).
+        # The resolved IP still goes through validate_bind below,
+        # so only a 100.64.0.0/10 address is ever bound. Only the
+        # resolved IP is ever logged — never the token.
+        self.bind_raw = self.bind
+        self.bind_mode = "explicit"
+        if self.bind.strip().lower() == "tailscale":
+            self.bind = resolve_tailscale_ip()
+            self.bind_mode = "tailscale"
         self.workspace = Path(pick(
             args.workspace, "HYDRA_WORKSPACE", "workspace",
             str(home / "hydra-workspace"))).expanduser()
@@ -174,6 +208,7 @@ class HydraHandler(BaseHTTPRequestHandler):
     audit: AuditLog
     store: MemoryStore
     jobs: JobManager
+    workflows: WorkflowManager
     server: ThreadingHTTPServer  # type: ignore[assignment]
 
     protocol_version = "HTTP/1.1"
@@ -259,6 +294,13 @@ class HydraHandler(BaseHTTPRequestHandler):
                 "uptime_seconds": uptime,
                 "jobs_running": counts["running"],
                 "jobs_finished": counts["finished"],
+                # v0.4: video tool presence booleans (no paths, no
+                # versions — presence only, same minimal spirit).
+                "video_tools": video_tools(),
+                # v0.4 (Tailscale-auto): Tailscale presence /
+                # connection / IP only. No keys, no peer data, no
+                # secrets; the probe never fails the health check.
+                "tailscale": tailscale_summary(),
             })
             return
         self._send_json(404, {"ok": False, "error": "unknown endpoint"})
@@ -287,6 +329,8 @@ class HydraHandler(BaseHTTPRequestHandler):
             "/input/click": self._handle_input_click,
             "/input/type": self._handle_input_type,
             "/system/info": self._handle_system_info,
+            "/system/tailscale": self._handle_system_tailscale,
+            "/system/doctor": self._handle_system_doctor,
             "/git/status": self._handle_git_status,
             "/browser/status": self._handle_browser_status,
             "/browser/navigate": self._handle_browser_navigate,
@@ -295,6 +339,12 @@ class HydraHandler(BaseHTTPRequestHandler):
             "/browser/shot": self._handle_browser_shot,
             "/browser/click": self._handle_browser_click,
             "/browser/type": self._handle_browser_type,
+            "/video/probe": self._handle_video_probe,
+            "/video/project/create": self._handle_video_project_create,
+            "/video/render/start": self._handle_video_render_start,
+            "/video/render/poll": self._handle_video_render_poll,
+            "/video/preview": self._handle_video_preview,
+            "/video/list": self._handle_video_list,
             "/shutdown": self._handle_shutdown,
         }
         handler = routes.get(path)
@@ -921,6 +971,49 @@ class HydraHandler(BaseHTTPRequestHandler):
         self._audit("/system/info", True)
         self._send_json(200, {"ok": True, **result})
 
+    def _handle_system_tailscale(self, payload: dict) -> None:
+        """Read-only Tailscale status (secret-free summary only).
+
+        501 when the tailscale binary is missing; 502 when
+        tailscaled is down or its output is unusable; 200 with
+        connected=false when Tailscale is installed but not
+        connected (e.g. NeedsLogin). No keys or peer records are
+        ever returned — see hydra/tailscale.py.
+        """
+        try:
+            result = tailscale_status()
+        except TailscaleUnavailableError as exc:
+            self._audit("/system/tailscale", False,
+                        reason="tailscale_missing")
+            self._send_json(501, {"ok": False, "error": str(exc)})
+            return
+        except TailscaleError as exc:
+            self._audit("/system/tailscale", False,
+                        reason="tailscale_down")
+            self._send_json(502, {"ok": False, "error": str(exc)})
+            return
+        self._audit("/system/tailscale", True,
+                    connected=result["connected"],
+                    peer_count=result["peer_count"])
+        self._send_json(200, {"ok": True, **result})
+
+    def _handle_system_doctor(self, payload: dict) -> None:
+        """Read-only readiness report. The doctor never fixes
+        anything and never reads the token file's contents; fix
+        hints are commands the USER runs by hand."""
+        result = run_doctor(
+            workspace=self.config.workspace,
+            data_dir=getattr(self.config, "data_dir", None),
+            token_file=getattr(self.config, "token_file", None),
+            bind=self.config.bind,
+            port=self.config.port,
+            bind_mode=getattr(self.config, "bind_mode", "explicit"),
+        )
+        self._audit("/system/doctor", True,
+                    overall=result["overall"],
+                    summary=result["summary"])
+        self._send_json(200, {"ok": True, **result})
+
     def _handle_git_status(self, payload: dict) -> None:
         rel = str(payload.get("path", ".") or ".")
         try:
@@ -1130,6 +1223,262 @@ class HydraHandler(BaseHTTPRequestHandler):
                     sha256=sha256_prefix(str(text).encode("utf-8")))
         self._send_json(200, {"ok": True, **result})
 
+    # -- video endpoints (v0.4, headless MLT/melt) -------------------------
+
+    def _rel_to_workspace(self, abs_path: str) -> str:
+        """Workspace-relative form of an absolute path (for responses
+        that must not leak absolute paths). Falls back to the name."""
+        try:
+            root = resolve_inside(self.config.workspace, ".")
+            return str(Path(abs_path).relative_to(root))
+        except ValueError:
+            return Path(abs_path).name
+
+    def _handle_video_probe(self, payload: dict) -> None:
+        rel = str(payload.get("path", ""))
+        try:
+            path = resolve_inside(self.config.workspace, rel)
+        except ValueError as exc:
+            self._audit("/video/probe", False, reason="path_escape",
+                        path=rel[:256])
+            self._send_json(403, {"ok": False, "error": str(exc)})
+            return
+        if not path.is_file():
+            self._audit("/video/probe", False, reason="not_found",
+                        path=rel[:256])
+            self._send_json(404, {"ok": False, "error": "not a file"})
+            return
+        try:
+            probe = probe_media(path)
+        except VideoUnavailableError as exc:
+            self._audit("/video/probe", False, reason="ffprobe_missing")
+            self._send_json(501, {"ok": False, "error": str(exc)})
+            return
+        except VideoError as exc:
+            self._audit("/video/probe", False, reason="probe_failed",
+                        path=rel[:256])
+            self._send_json(400, {"ok": False, "error": str(exc)})
+            return
+        probe["path"] = rel
+        self._audit("/video/probe", True, path=rel[:256],
+                    has_video=probe["has_video"],
+                    has_audio=probe["has_audio"],
+                    duration=probe["duration"])
+        self._send_json(200, {"ok": True, **probe})
+
+    def _handle_video_project_create(self, payload: dict) -> None:
+        # The payload IS the timeline spec: name/profile/tracks/
+        # transitions/subtitle/assets, plus optional overwrite.
+        overwrite = bool(payload.get("overwrite", False))
+        try:
+            result = create_project(
+                self.config.workspace, payload, overwrite=overwrite)
+        except FileExistsError as exc:
+            self._audit("/video/project/create", False, reason="exists")
+            self._send_json(409, {"ok": False, "error": str(exc)})
+            return
+        except VideoError as exc:
+            self._audit("/video/project/create", False,
+                        reason="invalid_spec")
+            self._send_json(400, {"ok": False, "error": str(exc)})
+            return
+        except ValueError as exc:  # jail escapes surface as ValueError
+            self._audit("/video/project/create", False,
+                        reason="path_escape")
+            self._send_json(403, {"ok": False, "error": str(exc)})
+            return
+        self._audit("/video/project/create", True,
+                    project_id=result["project_id"],
+                    clip_count=result["clip_count"],
+                    duration=result["duration"])
+        self._send_json(200, {"ok": True, **result})
+
+    def _handle_video_render_start(self, payload: dict) -> None:
+        project_id = str(payload.get("project_id", ""))
+        try:
+            timeline = load_project(self.config.workspace, project_id)
+        except FileNotFoundError as exc:
+            self._send_json(404, {"ok": False, "error": str(exc)})
+            return
+        except VideoError as exc:
+            self._send_json(400, {"ok": False, "error": str(exc)})
+            return
+        output_rel = str(payload.get("output")
+                         or f"video/{project_id}/output.mp4")
+        try:
+            resolve_inside(self.config.workspace, output_rel)
+        except ValueError as exc:
+            self._audit("/video/render/start", False, reason="path_escape")
+            self._send_json(403, {"ok": False, "error": str(exc)})
+            return
+        # Honest availability check BEFORE any workflow is created:
+        # without melt there is nothing to queue, so this is a 501,
+        # for dry runs and real starts alike.
+        if not video_tools()["melt"]:
+            self._audit("/video/render/start", False,
+                        reason="melt_missing", project_id=project_id)
+            self._send_json(501, {
+                "ok": False,
+                "error": "melt is not installed; install it with: "
+                         "sudo pacman -S mlt (see docs/VIDEO_SETUP.md)",
+            })
+            return
+        try:
+            timeout = int(payload.get("timeout_seconds", 14400))
+        except (TypeError, ValueError):
+            timeout = 14400
+        timeout = max(60, min(timeout, 86400))
+        duration = float(timeline.get("duration") or 0)
+        profile = str(timeline.get("profile") or "1080p30")
+        needed = estimate_output_bytes(duration, profile)
+        guard = check_disk_space(self.config.workspace, needed)
+        if not guard["ok"]:
+            self._audit("/video/render/start", False,
+                        reason="disk_guard", project_id=project_id,
+                        free_bytes=guard["free_bytes"],
+                        needed_bytes=needed)
+            self._send_json(507, {
+                "ok": False,
+                "error": "disk guard refused the render: free space "
+                         f"{guard['free_bytes']} bytes < estimated need "
+                         f"{needed} bytes; free space and retry",
+                "free_bytes": guard["free_bytes"],
+                "needed_bytes": needed,
+            })
+            return
+        if bool(payload.get("dry_run", False)):
+            self._audit("/video/render/start", True, dry_run=True,
+                        project_id=project_id)
+            self._send_json(200, {
+                "ok": True, "dry_run": True, "project_id": project_id,
+                "profile": profile, "duration": duration,
+                "output_path": output_rel,
+                "estimated_bytes": needed,
+                "free_bytes": guard["free_bytes"],
+                "melt_available": True,
+            })
+            return
+        try:
+            created = self.workflows.create_workflow(
+                project_id, output_rel, timeout_seconds=timeout)
+            started = self.workflows.start(created["workflow_id"])
+        except FileNotFoundError as exc:
+            self._send_json(404, {"ok": False, "error": str(exc)})
+            return
+        except WorkflowError as exc:
+            self._send_json(400, {"ok": False, "error": str(exc)})
+            return
+        self._audit("/video/render/start", True,
+                    project_id=project_id,
+                    workflow_id=started["workflow_id"],
+                    output_path=output_rel[:256])
+        self._send_json(200, {"ok": True, **started})
+
+    def _handle_video_render_poll(self, payload: dict) -> None:
+        workflow_id = str(payload.get("workflow_id", ""))
+        snapshot = self.workflows.snapshot(workflow_id)
+        if snapshot is None:
+            self._send_json(404, {"ok": False, "error": "unknown workflow_id"})
+            return
+        if bool(payload.get("resume", False)):
+            try:
+                snapshot = self.workflows.resume(workflow_id)
+            except WorkflowError as exc:
+                self._audit("/video/render/poll", False,
+                            reason="resume_refused",
+                            workflow_id=workflow_id)
+                self._send_json(409, {"ok": False, "error": str(exc)})
+                return
+            self._audit("/video/render/poll", True,
+                        workflow_id=workflow_id, resumed=True,
+                        status=snapshot["status"])
+            self._send_json(200, {"ok": True, **snapshot})
+            return
+        self._audit("/video/render/poll", True, workflow_id=workflow_id,
+                    status=snapshot["status"],
+                    progress_percent=snapshot["progress_percent"])
+        self._send_json(200, {"ok": True, **snapshot})
+
+    def _handle_video_preview(self, payload: dict) -> None:
+        rel = str(payload.get("path", ""))
+        try:
+            path = resolve_inside(self.config.workspace, rel)
+        except ValueError as exc:
+            self._audit("/video/preview", False, reason="path_escape",
+                        path=rel[:256])
+            self._send_json(403, {"ok": False, "error": str(exc)})
+            return
+        if not path.is_file():
+            self._send_json(404, {"ok": False, "error": "not a file"})
+            return
+        output_dir_rel = payload.get("output_dir")
+        if output_dir_rel is not None:
+            try:
+                output_dir = resolve_inside(
+                    self.config.workspace, str(output_dir_rel))
+            except ValueError as exc:
+                self._audit("/video/preview", False,
+                            reason="path_escape")
+                self._send_json(403, {"ok": False, "error": str(exc)})
+                return
+        else:
+            output_dir = path.parent / "previews"
+        timestamps = payload.get("timestamps")
+        if timestamps is None:
+            try:
+                probe = probe_media(path)
+            except VideoUnavailableError as exc:
+                self._audit("/video/preview", False,
+                            reason="ffprobe_missing")
+                self._send_json(501, {"ok": False, "error": str(exc)})
+                return
+            except VideoError as exc:
+                self._send_json(400, {"ok": False, "error": str(exc)})
+                return
+            duration = probe.get("duration")
+            if duration is None:
+                self._send_json(400, {
+                    "ok": False,
+                    "error": "cannot pick preview timestamps: media has "
+                             "no duration; pass timestamps explicitly"})
+                return
+            timestamps = [round(float(duration) * f, 3)
+                          for f in (0.1, 0.5, 0.9)]
+        if not isinstance(timestamps, list) or not timestamps:
+            self._send_json(400, {
+                "ok": False,
+                "error": "timestamps must be a non-empty list of seconds"})
+            return
+        try:
+            frames = extract_frames(path, timestamps, output_dir)
+        except VideoUnavailableError as exc:
+            self._audit("/video/preview", False, reason="ffmpeg_missing")
+            self._send_json(501, {"ok": False, "error": str(exc)})
+            return
+        except VideoError as exc:
+            self._send_json(400, {"ok": False, "error": str(exc)})
+            return
+        rel_frames = [{"timestamp": f["timestamp"],
+                       "path": self._rel_to_workspace(f["path"]),
+                       "bytes": f["bytes"]} for f in frames]
+        self._audit("/video/preview", True, path=rel[:256],
+                    frames=len(rel_frames))
+        self._send_json(200, {
+            "ok": True, "path": rel, "frames": rel_frames,
+            "paths": [f["path"] for f in rel_frames],
+        })
+
+    def _handle_video_list(self, payload: dict) -> None:
+        projects = list_projects(self.config.workspace)
+        workflows = self.workflows.list_workflows()
+        self._audit("/video/list", True, projects=len(projects),
+                    workflows=len(workflows))
+        self._send_json(200, {
+            "ok": True, "projects": projects,
+            "workflows": workflows,
+            "render_busy": self.workflows.render_busy(),
+        })
+
     # -- shutdown ----------------------------------------------------------
 
     def _handle_shutdown(self, payload: dict) -> None:
@@ -1139,9 +1488,12 @@ class HydraHandler(BaseHTTPRequestHandler):
             })
             return
         killed = self.jobs.kill_all()
-        self._audit("/shutdown", True, jobs_killed=killed)
+        interrupted = self.workflows.interrupt_all()
+        self._audit("/shutdown", True, jobs_killed=killed,
+                    workflows_interrupted=interrupted)
         self._send_json(200, {"ok": True, "message": "shutting down",
-                              "jobs_killed": killed})
+                              "jobs_killed": killed,
+                              "workflows_interrupted": interrupted})
         # Shut down from a thread: shutdown() blocks until serve_forever
         # returns, and we are inside a request handler thread.
         threading.Thread(target=self.server.shutdown, daemon=True).start()
@@ -1230,21 +1582,35 @@ def make_server(config: Config, token: str) -> ThreadingHTTPServer:
     handler.store = MemoryStore(config.db_path)
     jobs = JobManager(data_dir=getattr(config, "data_dir", None))
     handler.jobs = jobs
+    try:
+        workflows = WorkflowManager(
+            workspace=config.workspace,
+            data_dir=getattr(config, "data_dir", None))
+    except Exception as exc:  # degrade to in-memory, loudly (like jobs)
+        print(f"[hydra] video workflow persistence unavailable "
+              f"({exc}); running in-memory only", file=sys.stderr)
+        workflows = WorkflowManager(workspace=config.workspace)
+    handler.workflows = workflows
     handler.started_at = time.monotonic()
     # If the daemon process exits (Ctrl-C, shutdown), kill any running
     # NON-detached background jobs instead of orphaning them. Detached
     # jobs survive on purpose and are re-attached on the next start.
     atexit.register(jobs.kill_all)
+    # Video workflows are interrupted (resumable), never orphaned:
+    # a running melt is killed and the workflow can be resumed.
+    atexit.register(workflows.interrupt_all)
     return ThreadingHTTPServer((config.bind, config.port), handler)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="hydra",
-        description="HYDRA v0.3 dumb-executor daemon (no model, no network calls).",
+        description="HYDRA v0.4 dumb-executor daemon (no model, no network calls).",
     )
     parser.add_argument("--bind", default=None,
-                        help=f"bind address (default {DEFAULT_BIND})")
+                        help=f"bind address (default {DEFAULT_BIND}); "
+                             "use 'tailscale' to resolve the current "
+                             "Tailscale IPv4 via `tailscale ip -4`")
     parser.add_argument("--port", type=int, default=None,
                         help=f"port (default {DEFAULT_PORT})")
     parser.add_argument("--workspace", default=None,
@@ -1264,10 +1630,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
-    config = Config(args)
     try:
+        # Config construction resolves --bind tailscale (fail-closed
+        # when Tailscale is down) and reads the optional config file.
+        config = Config(args)
         validate_bind(config.bind, config.allow_public)
-    except ValueError as exc:
+    except (ValueError, RuntimeError, OSError) as exc:
         print(f"[hydra] refusing to start: {exc}", file=sys.stderr)
         return 2
     try:
@@ -1287,14 +1655,18 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         pid_path = None
     print("=" * 64)
-    print("HYDRA daemon v0.3  —  DUMB EXECUTOR ONLY")
+    print("HYDRA daemon v0.4  —  DUMB EXECUTOR ONLY")
     print("No model. No Ollama. No LLM calls. Mikey (cloud) is the brain.")
     print("=" * 64)
     print(f"Listening on  http://{config.bind}:{config.port}")
+    if getattr(config, "bind_mode", "explicit") == "tailscale":
+        print(f"Bind mode     tailscale (resolved to {config.bind} "
+              "via `tailscale ip -4`)")
     print(f"Workspace     {config.workspace}")
     print(f"Data dir      {config.data_dir}")
     print(f"Memory DB     {config.db_path}")
     print(f"Jobs DB       {config.data_dir / 'jobs.db'}")
+    print(f"Video DB      {config.data_dir / 'video.db'}")
     print(f"Audit log     {config.audit_path}")
     print(f"PID file      {pid_path}")
     print(f"Token file    {config.token_file}  (never share this file)")

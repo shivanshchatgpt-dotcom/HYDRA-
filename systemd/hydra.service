@@ -24,8 +24,11 @@
 # NOTE: This unit assumes the repo lives at ~/hydra-harness. If you
 # cloned it elsewhere, edit WorkingDirectory and ExecStart below.
 # NOTE: It binds localhost only. For Tailscale access, edit ExecStart
-# to add --bind <TAILSCALE-IP>, or keep localhost-only and start the
-# daemon manually when Mikey needs access (recommended).
+# to add --bind tailscale (the daemon resolves the current Tailscale
+# IP itself and refuses to start if Tailscale is down — see
+# docs/TAILSCALE_AUTO.md), or --bind <TAILSCALE-IP>, or keep
+# localhost-only and start the daemon manually when Mikey needs
+# access (recommended).
 # NOTE (v0.2 GUI endpoints): /screen/shot and /input/* need the
 # daemon to run INSIDE the graphical session (WAYLAND_DISPLAY set,
 # access to the session bus and ydotoold). A user unit started at

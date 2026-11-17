@@ -1,9 +1,9 @@
-# HYDRA v0.3 — Laptop Harness (Tailscale + Dumb Daemon)
+# HYDRA v0.4 — Laptop Harness (Tailscale + Dumb Daemon)
 
 > **Mikey (in the cloud) is the brain. This daemon is only the body.**
 > The daemon never thinks, never calls a model, never goes on the internet.
-> It only runs the exact file / shell / memory / screen / browser
-> operations Mikey asks for, inside one workspace folder (plus opt-in
+> It only runs the exact file / shell / memory / screen / browser /
+> video operations Mikey asks for, inside one workspace folder (plus opt-in
 > screen/input control and loopback-only browser control), with a
 > blocklist and an audit log.
 
@@ -18,7 +18,9 @@ KDE Plasma, Wayland) and gives Mikey a *virtual body* on that laptop:
   write files, patch-edit files, search code (ripgrep/grep), run shell
   commands (sync or as background jobs, optionally in a bubblewrap
   sandbox), store/search/delete small long-term memories, read system
-  info and git status (read-only), and — when the optional GUI tools
+  info and git status (read-only), build and render videos headlessly
+  (MLT XML timelines rendered by `melt`, no GUI — see
+  `docs/VIDEO_SETUP.md`), and — when the optional GUI tools
   are installed — take screenshots and send mouse/keyboard input.
   When Chrome is running with remote debugging on loopback, it can
   also drive that Chrome over CDP (navigate, evaluate, read content,
@@ -27,7 +29,10 @@ KDE Plasma, Wayland) and gives Mikey a *virtual body* on that laptop:
   per-job log files, and **detached** jobs keep running across daemon
   restarts and are re-attached when the daemon comes back — so work
   continues without Baji present. See `docs/AUTONOMY.md` for exactly
-  what runs without him and what still needs him.
+  what runs without him and what still needs him. Video renders are
+  persistent the same way: six-step workflows checkpointed in
+  `video.db`, resumable explicitly after a restart, one render at a
+  time, with a disk-space guard — see `docs/VIDEO_SETUP.md`.
 - Every request needs a bearer token, stays inside the workspace jail,
   passes a visible command blocklist, and is written to an audit log
   (before the response is sent).
@@ -71,7 +76,14 @@ Baji's chat  ->  Mikey (cloud brain: thinks, plans, writes code)
                       |   ydotool mouse/keyboard — see docs/GUI_SETUP.md
                       +-- browser (opt-in): Chrome over CDP, loopback
                       |   only — see docs/BROWSER_SETUP.md
+                      +-- video (headless): MLT XML timelines, melt
+                      |   render, ffprobe validation, ffmpeg previews
+                      |   — see docs/VIDEO_SETUP.md
                       +-- read-only: /system/info, /git/status
+                      +-- tailscale-auto: --bind tailscale,
+                      |   /system/tailscale, /system/doctor,
+                      |   pair/setup/kill-switch scripts
+                      |   — see docs/TAILSCALE_AUTO.md
                       +-- audit log: ~/.local/share/hydra/audit.jsonl
                       +-- PID file: ~/.local/share/hydra/hydra.pid
                       +-- memory: ~/.local/share/hydra/memory.db
@@ -95,8 +107,10 @@ Threat model and revocation: see `SECURITY.md`.
   `spectacle` or `grim` (screenshots), `ydotool` + `ydotoold`
   (mouse/keyboard input), `git` (`/git/status`),
   `google-chrome`/`chromium` with `--remote-debugging-port=9222`
-  (`/browser/*` endpoints). See `docs/GUI_SETUP.md` and
-  `docs/BROWSER_SETUP.md` for exact setup.
+  (`/browser/*` endpoints), `kdenlive` + `mlt` (`melt`) + `ffmpeg`/
+  `ffprobe` (`/video/*` endpoints — headless, no GUI needed).
+  See `docs/GUI_SETUP.md`, `docs/BROWSER_SETUP.md`, and
+  `docs/VIDEO_SETUP.md` for exact setup.
 
 ## Setup (on the laptop, run by Baji)
 
@@ -126,13 +140,21 @@ python3 hydra_client.py search --pattern "TODO"
 python3 hydra_client.py screen-shot --save-to shots/shot.png
 ```
 
-To let Mikey reach it over Tailscale, find the laptop's Tailscale IP and
-restart the daemon bound to it (see `scripts/install-arch.sh` output):
+To let Mikey reach it over Tailscale, start the daemon with
+`--bind tailscale` — it resolves the laptop's current Tailscale IP
+itself and refuses to start if Tailscale is down (see
+`docs/TAILSCALE_AUTO.md`):
 
 ```bash
-tailscale ip -4
-./scripts/start-daemon.sh --bind <TAILSCALE-IP> --port 8765
+./scripts/start-daemon.sh --bind tailscale
 ```
+
+(The older manual form, `./scripts/start-daemon.sh --bind
+<TAILSCALE-IP> --port 8765` after `tailscale ip -4`, still works.)
+`./scripts/pair.sh` prints a read-only pairing card (Tailscale IP,
+daemon URLs, token fingerprint prefix only) and
+`./scripts/setup-tailscale.sh` prints the exact setup commands to
+run by hand.
 
 Mikey's side then connects through the Tailscale tunnel proxy to
 `http://<TAILSCALE-IP>:8765` with the bearer token. Baji must share
@@ -151,7 +173,9 @@ Any one of these stops Mikey's access completely:
 
 To fully revoke: stop the daemon, rotate the token
 (`python3 scripts/generate_token.py --force`), and optionally delete
-`~/.local/share/hydra/`. See `SECURITY.md`.
+`~/.local/share/hydra/`. See `SECURITY.md`. The scripted form is
+`./scripts/kill-switch.sh --confirm` (local only, never
+remote-triggerable — see `docs/TAILSCALE_AUTO.md`).
 
 > **Detached jobs keep running after the daemon stops.** The kill
 > switch above stops Mikey's *access* instantly, but a detached job
@@ -160,6 +184,51 @@ To fully revoke: stop the daemon, rotate the token
 > `python3 hydra_client.py jobs-kill --job-id <id>` before stopping
 > the daemon, or with plain `ps`/`kill` afterwards. `/jobs/list`
 > shows what is running. See `docs/AUTONOMY.md`.
+
+## What's new in v0.4
+
+- Headless video pipeline: timeline specs become MLT XML
+  (`hydra/video.py`), rendered by `melt` without opening Kdenlive —
+  multi-track clips, trims, stills, pango titles, crossfade/mix
+  transitions, per-clip volume, SRT/VTT subtitle burn via ffmpeg.
+  Profiles: `1080p30`, `1080p30-vertical`, `720p30`, `1080p25`.
+- Long-horizon workflows (`hydra/workflows.py`): fixed six-step DAG
+  (ingest -> probe -> timeline -> render -> validate -> preview),
+  checkpointed in `video.db`, explicitly resumable after a daemon
+  restart, transient-failure retry with backoff, one render at a
+  time, disk-space guard (HTTP 507 when free space is below the
+  estimate). Nothing auto-resumes; the daemon still has no
+  scheduler and no agent loop.
+- New endpoints: `/video/probe`, `/video/project/create`,
+  `/video/render/start` (with `dry_run`), `/video/render/poll`
+  (with `resume`), `/video/preview`, `/video/list`. `GET /health`
+  gains `video_tools` presence booleans (kdenlive/melt/ffmpeg/
+  ffprobe). Asset manifests (`manifest.json`: SHA256 + probe +
+  source/license note per asset) record provenance; the daemon
+  never downloads anything and has no auto-scraper.
+- `docs/VIDEO_SETUP.md`: Arch install, the six steps, resume rules,
+  disk-space guidance, and the live laptop verification checklist.
+  NOT verified yet: no melt/Kdenlive on the build VM, so real
+  renders, crossfades, titles, and Kdenlive round-trips all need
+  live checks on Baji's laptop (see the checklist).
+- Tailscale-auto (same 0.4.0 release): `--bind tailscale` resolves
+  the current Tailscale IP at startup and fails closed when
+  Tailscale is down; read-only `POST /system/tailscale` (connected
+  state, hostname, peer count — no keys, no peer list) and `POST
+  /system/doctor` (tool/disk/token-permissions/workspace/unit/bind
+  checks, fix hints only, never auto-fix); `GET /health` gains
+  `tailscale` fields; laptop scripts `pair.sh` (pairing card,
+  token fingerprint first 12 chars only), `setup-tailscale.sh`
+  (prints the setup commands, never runs `sudo` itself; opt-in
+  `--enable-autostart` for the user unit only), and
+  `kill-switch.sh` (local only, deletes token+data only with
+  `--confirm`). Honest limits: this does NOT remove the per-session
+  token handoff, adds no relay/Cloudflare/HTTPS/public bind, and
+  the laptop must still be on and awake. See
+  `docs/TAILSCALE_AUTO.md`. NOT verified live yet: no tailscaled
+  or systemd user session on the build VM.
+
+Full list: see `CHANGELOG.md`.
 
 ## What's new in v0.3
 
@@ -221,7 +290,9 @@ repurposed into this harness). Nothing was deleted from git history.
 
 | Path | What it is |
 |---|---|
-| `hydra/daemon.py` | HTTP API + exec/read/write/edit/search/jobs/GUI/browser/system/git/shutdown |
+| `hydra/daemon.py` | HTTP API + exec/read/write/edit/search/jobs/GUI/browser/system/git/video/shutdown |
+| `hydra/video.py` | ffprobe probing, timeline model, MLT XML generation, melt render, validation, previews, manifests, disk guard |
+| `hydra/workflows.py` | Persistent resumable 6-step video workflows (video.db), retry/backoff, single-render queue |
 | `hydra/security.py` | Workspace jail + command blocklist + token checks |
 | `hydra/memory_store.py` | SQLite FTS5 + graph memory (no model) |
 | `hydra/audit.py` | Append-only JSONL audit log |
@@ -232,20 +303,29 @@ repurposed into this harness). Nothing was deleted from git history.
 | `hydra/websocket.py` | Stdlib-only WebSocket client (RFC 6455, for CDP) |
 | `hydra/browser.py` | CDP browser control, loopback only |
 | `hydra/sysinfo.py` | Read-only system info + git status |
+| `hydra/tailscale.py` | Local `tailscale` CLI parsing: IP resolution, status summary (no keys/peers) |
+| `hydra/doctor.py` | Read-only self-checks: tools, disk floor, token mode, unit, bind (never auto-fixes) |
 | `hydra_client.py` | Stdlib test client |
 | `scripts/generate_token.py` | 0600 token generator |
 | `scripts/install-arch.sh` | Arch setup checks + dirs + token |
 | `scripts/start-daemon.sh` | Foreground start (manual only) |
 | `scripts/chrome-debug.sh` | Launch Chrome with remote debugging (never kills Chrome) |
+| `scripts/pair.sh` | Read-only pairing card (token fingerprint prefix only) |
+| `scripts/setup-tailscale.sh` | Tailscale setup checks + printed commands (never runs sudo; opt-in `--enable-autostart`) |
+| `scripts/kill-switch.sh` | Local kill switch; deletes token+data only with `--confirm` |
 | `systemd/hydra.service` | Opt-in user unit, Restart=always (NOT enabled by setup) |
 | `config.example.json` | Example config (no secrets in it) |
 | `tests/test_daemon.py` | v0.1 stdlib unittest suite (30 tests) |
 | `tests/test_v02.py` | v0.2 stdlib unittest suite |
 | `tests/test_v03.py` | v0.3 stdlib unittest suite |
+| `tests/test_v04.py` | v0.4 stdlib unittest suite (video + workflows) |
+| `tests/test_tailscale.py` | v0.4 Tailscale-auto suite (fake `tailscale`/`systemctl` binaries) |
 | `tests/fake_cdp.py` | Fake CDP server for browser/WebSocket tests |
 | `docs/ARCHITECTURE.md` | Design + endpoint examples |
 | `docs/GUI_SETUP.md` | GUI/sandbox laptop setup + live verification |
 | `docs/BROWSER_SETUP.md` | Chrome debugging setup + live CDP checklist |
+| `docs/VIDEO_SETUP.md` | Headless video setup + live render checklist |
+| `docs/TAILSCALE_AUTO.md` | Tailscale-auto setup, pairing card, doctor, kill switch, honest limits |
 | `docs/AUTONOMY.md` | What runs without Baji, what still needs him |
 | `CHANGELOG.md` | Version history |
 | `SECURITY.md` | Threat model + rotation + revocation |

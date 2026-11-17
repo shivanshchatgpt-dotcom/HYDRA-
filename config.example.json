@@ -1,5 +1,5 @@
 {
-    "_comment": "HYDRA v0.3 example config. Copy to ~/.config/hydra/config.json and edit. CLI flags and HYDRA_* env vars override these values. NEVER put the bearer token in this file. v0.3 adds no new config keys: persistent/detached jobs, system/git endpoints and CDP browser control are requested per-call (browser control is loopback-only by code, not by config; see docs/BROWSER_SETUP.md).",
+    "_comment": "HYDRA v0.4 example config. Copy to ~/.config/hydra/config.json and edit. CLI flags and HYDRA_* env vars override these values. NEVER put the bearer token in this file. The bind value may also be the word \"tailscale\", which resolves the current Tailscale IPv4 at startup and fails closed when Tailscale is down (see docs/TAILSCALE_AUTO.md); the default stays 127.0.0.1. v0.4 adds no new config keys: video profiles, render timeouts and resume are requested per-call (see docs/VIDEO_SETUP.md); v0.3 added no new keys either (persistent/detached jobs, system/git endpoints and CDP browser control are requested per-call; browser control is loopback-only by code, not by config; see docs/BROWSER_SETUP.md).",
     "allow_systemctl_manage": false,
     "bind": "127.0.0.1",
     "blocklist_extra": [],
