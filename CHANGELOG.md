@@ -3,10 +3,16 @@
 All notable changes. Versions follow the daemon's `VERSION` in
 `hydra/daemon.py` / `hydra/__init__.py`.
 
-## Unreleased
+## 0.5.0 — 2026-11-18
 
 Added:
 
+- `POST /web/search` + `POST /web/fetch` (`hydra/web.py`): DuckDuckGo
+  HTML search (no key, no cookies) and one capped GET with HTML
+  reduced to text. SSRF guard refuses loopback/RFC1918/link-local/
+  CGNAT(100.64/10)/NAT64-embedded private targets before any socket
+  opens, and re-validates every redirect hop. URL path/query are never
+  logged (host + hash + sizes only).
 - `hydra/mcp_server.py`: a thin stdio MCP adapter that exposes the
   daemon's audited endpoints as 36 `hydra_*` tools, so any MCP host
   (Muse Code, Claude Code, Codex) can use HYDRA as its body. No new
@@ -14,6 +20,9 @@ Added:
   bearer token, workspace jail, blocklist, and audit log. Includes
   `--selfcheck` (schema validation + daemon probe) and `--list-tools`.
   See `docs/MCP_SETUP.md`.
+- `hydra_web_search` / `hydra_web_fetch` MCP tools (38 total),
+  `tests/test_web.py` (14 tests: URL policy, NAT64/CGNAT handling,
+  parsers, redirect refusal, truncation).
 
 ## 0.4.0 — 2026-11-17
 

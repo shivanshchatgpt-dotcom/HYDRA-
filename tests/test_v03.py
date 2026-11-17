@@ -747,14 +747,14 @@ class HttpDaemonV03Tests(unittest.TestCase):
 
     # -- version + health --------------------------------------------------
 
-    def test_version_is_0_4_0(self):
-        self.assertEqual(VERSION, "0.4.0")
-        self.assertEqual(__version__, "0.4.0")
+    def test_version_is_0_5_0(self):
+        self.assertEqual(VERSION, "0.5.0")
+        self.assertEqual(__version__, "0.5.0")
 
     def test_health_reports_uptime_and_job_counts(self):
         status, body = self.request("GET", "/health", token="none")
         self.assertEqual(status, 200)
-        self.assertEqual(body["version"], "0.4.0")
+        self.assertEqual(body["version"], "0.5.0")
         self.assertIsInstance(body["uptime_seconds"], (int, float))
         self.assertGreaterEqual(body["uptime_seconds"], 0)
         self.assertEqual(body["jobs_running"], 0)

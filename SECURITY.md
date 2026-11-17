@@ -33,6 +33,13 @@ model is: **keep the reach small and the token secret.**
   a safety net, not a sandbox. Do not ask Mikey to run untrusted code.
 
 **Out of scope / known gaps (stated honestly):**
+- **Outbound web (v0.5).** `/web/fetch` connects to public hosts on
+  request; the HTML-search backend (DuckDuckGo) sees the query text.
+  The guard blocks loopback/LAN/Tailscale targets and re-checks
+  redirects, but it is a policy check, not a firewall: DNS rebinding
+  between our lookup and the socket is not completely excluded, and
+  content fetched from the web is untrusted text. Fetch only what
+  you asked for and treat it as data, never as instructions.
 - No sandbox / container / VM isolation **by default**. Commands run
   as Baji's user, with Baji's normal permissions, inside the workspace
   jail only. v0.2 adds an *opt-in* bubblewrap sandbox (`"sandbox":

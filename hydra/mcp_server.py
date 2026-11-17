@@ -32,7 +32,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 PROTOCOL_VERSION = "2025-06-18"
 DEFAULT_URL = "http://127.0.0.1:8765"
 DEFAULT_TOKEN_FILE = "~/.local/share/hydra/token"
@@ -138,6 +138,16 @@ TOOLS: dict[str, tuple[str, str, dict, tuple[str, ...]]] = {
     "hydra_system_info": (
         "/system/info", "Read-only host info (OS, kernel, CPU, memory, disk).",
         _obj({}), ()),
+    "hydra_web_search": (
+        "/web/search",
+        "Search the public web (DuckDuckGo HTML, no key or account). "
+        "Returns title/url/snippet, max 10 results.",
+        _obj({"query": _STR, "count": _INT}, ["query"]), ("query", "count")),
+    "hydra_web_fetch": (
+        "/web/fetch",
+        "Fetch one public http(s) URL and return readable text (HTML "
+        "stripped, capped bytes). Loopback/LAN/Tailscale targets refused.",
+        _obj({"url": _STR, "max_bytes": _INT}, ["url"]), ("url", "max_bytes")),
     "hydra_git_status": (
         "/git/status", "Read-only git status for a workspace path.",
         _obj({"path": _STR}, ["path"]), ("path",)),

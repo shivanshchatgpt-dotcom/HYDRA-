@@ -36,6 +36,13 @@ KDE Plasma, Wayland) and gives Mikey a *virtual body* on that laptop:
 - Every request needs a bearer token, stays inside the workspace jail,
   passes a visible command blocklist, and is written to an audit log
   (before the response is sent).
+- **Web search + fetch, on request only.** `POST /web/search` (DuckDuckGo
+  HTML: no API key, no account, no cookies) and `POST /web/fetch` (one
+  GET, capped, HTML reduced to text). Outbound requests are
+  **caller-initiated** — the daemon never browses, crawls or searches on
+  its own. A loopback/LAN/Tailscale guard refuses non-public targets
+  and re-checks every redirect hop, so an open redirect cannot bounce
+  it back to `127.0.0.1` or a Tailscale peer. See `docs/MCP_SETUP.md`.
 - **MCP hosts get the same body.** `python3 -m hydra.mcp_server` speaks
   the Model Context Protocol on stdio and exposes 36 `hydra_*` tools
   (files, shell, jobs, memory, screen, browser, video) as thin calls to
@@ -59,7 +66,8 @@ KDE Plasma, Wayland) and gives Mikey a *virtual body* on that laptop:
 - **No telemetry, no public bind.** The daemon binds `127.0.0.1` by
   default, starts only when Baji starts it (or when he explicitly
   enables the opt-in systemd unit), and sends nothing anywhere on
-  its own. Auto-start is never installed by setup; see
+  its own. Outbound web requests happen only when a caller asks for
+  `/web/search` or `/web/fetch`. Auto-start is never installed by setup; see
   `docs/AUTONOMY.md`.
 
 ## Architecture (one picture, in words)
@@ -143,6 +151,12 @@ python3 hydra_client.py list --path .
 python3 hydra_client.py exec --command "pwd && ls -la"
 python3 hydra_client.py search --pattern "TODO"
 python3 hydra_client.py screen-shot --save-to shots/shot.png
+curl -s -X POST http://127.0.0.1:8765/web/search \
+  -H "Authorization: Bearer $(cat ~/.local/share/hydra/token)" \
+  -H "Content-Type: application/json" -d '{"query": "mlt melt headless"}'
+curl -s -X POST http://127.0.0.1:8765/web/fetch \
+  -H "Authorization: Bearer $(cat ~/.local/share/hydra/token)" \
+  -H "Content-Type: application/json" -d '{"url": "https://example.com"}'
 ```
 
 To let Mikey reach it over Tailscale, start the daemon with

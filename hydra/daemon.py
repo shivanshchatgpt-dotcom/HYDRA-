@@ -72,6 +72,15 @@ from .security import (
     token_matches,
 )
 from .sysinfo import GitUnavailableError, git_status, system_info
+from .web import (
+    WebBlockedError,
+    WebError,
+    WebFetchError,
+    fetch as web_fetch,
+    search as web_search,
+    text_fingerprint,
+    url_fingerprint,
+)
 from .tailscale import (
     TailscaleError,
     TailscaleUnavailableError,
@@ -94,7 +103,7 @@ from .video import (
 )
 from .workflows import WorkflowError, WorkflowManager
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 DEFAULT_BIND = "127.0.0.1"
 DEFAULT_PORT = 8765
 DEFAULT_TIMEOUT_SECONDS = 30
@@ -331,6 +340,8 @@ class HydraHandler(BaseHTTPRequestHandler):
             "/system/info": self._handle_system_info,
             "/system/tailscale": self._handle_system_tailscale,
             "/system/doctor": self._handle_system_doctor,
+            "/web/search": self._handle_web_search,
+            "/web/fetch": self._handle_web_fetch,
             "/git/status": self._handle_git_status,
             "/browser/status": self._handle_browser_status,
             "/browser/navigate": self._handle_browser_navigate,
@@ -1014,6 +1025,53 @@ class HydraHandler(BaseHTTPRequestHandler):
                     summary=result["summary"])
         self._send_json(200, {"ok": True, **result})
 
+    def _handle_web_search(self, payload: dict) -> None:
+        query = payload.get("query", "")
+        if not isinstance(query, str) or not query.strip():
+            self._audit("/web/search", False, reason="bad_request")
+            self._send_json(400, {
+                "ok": False, "error": "query must be a non-empty string"})
+            return
+        try:
+            count = int(payload.get("count", 5))
+        except (TypeError, ValueError):
+            count = 5
+        fp = text_fingerprint(query)
+        try:
+            results = web_search(query, count)
+        except WebError as exc:
+            self._audit("/web/search", False, reason="failed",
+                        query=fp, error=str(exc)[:200])
+            self._send_json(502, {"ok": False, "error": str(exc)})
+            return
+        self._audit("/web/search", True, query=fp,
+                    result_count=len(results))
+        self._send_json(200, {
+            "ok": True, "results": results, "count": len(results)})
+
+    def _handle_web_fetch(self, payload: dict) -> None:
+        url = payload.get("url", "")
+        try:
+            result = web_fetch(url, payload.get("max_bytes", 200_000))
+        except WebBlockedError as exc:
+            self._audit("/web/fetch", False, reason="blocked")
+            self._send_json(403, {"ok": False, "error": str(exc),
+                                  "blocked": True})
+            return
+        except WebFetchError as exc:
+            self._audit("/web/fetch", False, reason="failed",
+                        error=str(exc)[:200])
+            self._send_json(502, {"ok": False, "error": str(exc)})
+            return
+        except WebError as exc:
+            self._audit("/web/fetch", False, reason="failed")
+            self._send_json(400, {"ok": False, "error": str(exc)})
+            return
+        self._audit("/web/fetch", True, url=url_fingerprint(result["url"]),
+                    status=result["status"], bytes=result["bytes"],
+                    truncated=result["truncated"])
+        self._send_json(200, {"ok": True, **result})
+
     def _handle_git_status(self, payload: dict) -> None:
         rel = str(payload.get("path", ".") or ".")
         try:
@@ -1605,7 +1663,7 @@ def make_server(config: Config, token: str) -> ThreadingHTTPServer:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="hydra",
-        description="HYDRA v0.4 dumb-executor daemon (no model, no network calls).",
+        description="HYDRA v0.5 dumb-executor daemon (no model; outbound web only when asked).",
     )
     parser.add_argument("--bind", default=None,
                         help=f"bind address (default {DEFAULT_BIND}); "

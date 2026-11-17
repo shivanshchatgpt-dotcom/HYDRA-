@@ -561,9 +561,9 @@ class HttpTailscaleTests(unittest.TestCase):
             parsed = {"_raw": raw}
         return resp.status, parsed
 
-    def test_version_stays_0_4_0(self):
-        self.assertEqual(VERSION, "0.4.0")
-        self.assertEqual(__version__, "0.4.0")
+    def test_version_stays_0_5_0(self):
+        self.assertEqual(VERSION, "0.5.0")
+        self.assertEqual(__version__, "0.5.0")
 
     def test_system_tailscale_ok_and_secret_free(self):
         status, body = self.request("POST", "/system/tailscale",
@@ -628,7 +628,7 @@ class HttpTailscaleTests(unittest.TestCase):
     def test_health_reports_tailscale_fields(self):
         status, body = self.request("GET", "/health", token="none")
         self.assertEqual(status, 200)
-        self.assertEqual(body["version"], "0.4.0")
+        self.assertEqual(body["version"], "0.5.0")
         self.assertEqual(body["tailscale"],
                          {"present": True, "connected": True,
                           "ip": "100.74.209.52"})

@@ -17,6 +17,7 @@ obvious kill switch (`scripts/kill-switch.sh`, or stop the daemon).
 | Group | Tools |
 |---|---|
 | health | `hydra_health` |
+| web | `hydra_web_search`, `hydra_web_fetch` |
 | files + shell | `hydra_exec`, `hydra_read_file`, `hydra_write_file`, `hydra_edit_file`, `hydra_list_dir`, `hydra_search` |
 | jobs | `hydra_job_start`, `hydra_job_poll`, `hydra_job_kill`, `hydra_job_list` |
 | memory | `hydra_memory_add`, `hydra_memory_search`, `hydra_memory_list`, `hydra_memory_delete` |
@@ -40,7 +41,7 @@ sandbox option, token, audit-before-response.
 ## Self-checks
 
 ```bash
-python3 -m hydra.mcp_server --selfcheck     # 36 tool schemas + daemon probe
+python3 -m hydra.mcp_server --selfcheck     # 38 tool schemas + daemon probe
 python3 -m hydra.mcp_server --list-tools    # JSON list for inspection
 ```
 
@@ -93,6 +94,10 @@ the repo root.)
 - Screen/input tools need `spectacle`/`grim` and `ydotool`; without
   them they fail loudly instead of pretending.
 - Browser tools refuse non-loopback CDP targets (`docs/BROWSER_SETUP.md`).
+- `hydra_web_fetch` refuses non-public addresses (loopback, RFC1918,
+  link-local, CGNAT/Tailscale `100.64/10`, NAT64-embedded private IPs)
+  and re-validates redirects; credentials in URLs are refused. Search
+  and fetch are the only outbound calls, and only when asked.
 - Tokens are read from a file, never logged, never passed in argv.
 - Audit entries are written by the daemon before the response, so the
   log reflects dropped/failed calls too.

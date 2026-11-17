@@ -132,8 +132,8 @@ class HttpDaemonV02Tests(unittest.TestCase):
         # Kept name (v0.2 test file); v0.4 bumps the version assertion.
         status, body = self.request("GET", "/health", token="none")
         self.assertEqual(status, 200)
-        self.assertEqual(body["version"], "0.4.0")
-        self.assertEqual(VERSION, "0.4.0")
+        self.assertEqual(body["version"], "0.5.0")
+        self.assertEqual(VERSION, "0.5.0")
 
     # -- /edit ---------------------------------------------------------
 
